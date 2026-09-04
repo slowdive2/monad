@@ -1,4 +1,4 @@
-# Permanent Intel VMX architecture checks.
+# intel vmx checks.
 
 $ErrorActionPreference = 'Stop'
 

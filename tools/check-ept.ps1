@@ -1,4 +1,4 @@
-# Permanent checks for the offline EPT builder.
+# ept builder checks.
 
 $ErrorActionPreference = 'Stop'
 

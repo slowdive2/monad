@@ -83,7 +83,7 @@ impl EptPageAllocator for WindowsPageAllocator {
         &mut self,
         max_physical_bits: u8,
     ) -> MonadResult<(Self::Allocation, HostPhysicalAddress)> {
-        // SAFETY: this pointer-free query only checks the caller's irql.
+        // safety: this pointer-free query only checks the caller's irql.
         if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL {
             return Err(MonadError::new(
                 ErrorPhase::EptBuild,
@@ -104,8 +104,8 @@ impl EptPageAllocator for WindowsPageAllocator {
             QuadPart: (limit - 1) as i64,
         };
         let boundary = PHYSICAL_ADDRESS { QuadPart: 0 };
-        // SAFETY: this runs at PASSIVE_LEVEL and asks Windows for one cached,
-        // Physically contiguous page below the checked address limit.
+        // safety: this runs at passive_level and asks windows for one cached,
+        // physically contiguous page below the checked address limit.
         let raw = unsafe {
             MmAllocateContiguousMemorySpecifyCache(PAGE_SIZE_4K, low, high, boundary, MmCached)
         };
@@ -116,9 +116,9 @@ impl EptPageAllocator for WindowsPageAllocator {
                 0,
             ));
         };
-        // SAFETY: Windows returned a writable allocation of exactly one page.
+        // safety: windows returned a writable allocation of exactly one page.
         unsafe { ptr::write_bytes(pointer.as_ptr().cast::<u8>(), 0, PAGE_SIZE_4K as usize) };
-        // SAFETY: the pointer names the allocation returned above.
+        // safety: the pointer names the allocation returned above.
         let physical = unsafe { MmGetPhysicalAddress(pointer.as_ptr().cast::<c_void>()).QuadPart };
         let hpa = match HostPhysicalAddress::for_mapping(
             physical as u64,
@@ -128,7 +128,7 @@ impl EptPageAllocator for WindowsPageAllocator {
         ) {
             Ok(hpa) if pointer.as_ptr() as usize & (PAGE_SIZE_4K as usize - 1) == 0 => hpa,
             _ => {
-                // SAFETY: this allocation has not escaped and is freed once.
+                // safety: this allocation has not escaped and is freed once.
                 unsafe { MmFreeContiguousMemory(pointer.as_ptr().cast()) };
                 return Err(MonadError::new(
                     ErrorPhase::EptBuild,
@@ -141,27 +141,27 @@ impl EptPageAllocator for WindowsPageAllocator {
     }
 
     fn entries(allocation: &Self::Allocation) -> &[u64; 512] {
-        // SAFETY: the token owns a live page for the whole borrow.
+        // safety: the token owns a live page for the whole borrow.
         unsafe { &allocation.0.as_ref().entries }
     }
 
     fn entries_mut(allocation: &mut Self::Allocation) -> &mut [u64; 512] {
-        // SAFETY: the mutable token owns the page exclusively.
+        // safety: the mutable token owns the page exclusively.
         unsafe { &mut allocation.0.as_mut().entries }
     }
 
     fn bytes(allocation: &Self::Allocation) -> &[u8; PAGE_SIZE_4K as usize] {
-        // SAFETY: the allocation is exactly one live aligned page.
+        // safety: the allocation is exactly one live aligned page.
         unsafe { &*allocation.0.as_ptr().cast::<[u8; PAGE_SIZE_4K as usize]>() }
     }
 
     fn bytes_mut(allocation: &mut Self::Allocation) -> &mut [u8; PAGE_SIZE_4K as usize] {
-        // SAFETY: the token owns the full page exclusively.
+        // safety: the token owns the full page exclusively.
         unsafe { &mut *allocation.0.as_ptr().cast::<[u8; PAGE_SIZE_4K as usize]>() }
     }
 
     fn free_page(&mut self, allocation: Self::Allocation) {
-        // SAFETY: the token is consumed, so the page is freed once.
+        // safety: the token is consumed, so the page is freed once.
         unsafe { MmFreeContiguousMemory(allocation.0.as_ptr().cast()) };
     }
 }
@@ -416,12 +416,12 @@ pub(super) mod fake {
         }
 
         fn bytes(allocation: &Self::Allocation) -> &[u8; PAGE_SIZE_4K as usize] {
-            // SAFETY: the boxed table is one initialized page.
+            // safety: the boxed table is one initialized page.
             unsafe { &*core::ptr::from_ref(&*allocation.0).cast::<[u8; PAGE_SIZE_4K as usize]>() }
         }
 
         fn bytes_mut(allocation: &mut Self::Allocation) -> &mut [u8; PAGE_SIZE_4K as usize] {
-            // SAFETY: the box owns the full page exclusively.
+            // safety: the box owns the full page exclusively.
             unsafe {
                 &mut *core::ptr::from_mut(&mut *allocation.0).cast::<[u8; PAGE_SIZE_4K as usize]>()
             }

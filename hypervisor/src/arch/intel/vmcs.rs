@@ -75,7 +75,7 @@ pub struct GuestRegs {
 global_asm!(
     r#"
 
-// Rcx holds the output ptr, so the original rcx is already gone
+// rcx holds the output ptr, so the original rcx is already gone
 .global capture_registers
 capture_registers:
     mov     [rcx + {registers_rax}], rax
@@ -99,11 +99,11 @@ capture_registers:
     pop     rax
     mov     [rcx + {registers_rflags}], rax
 
-    // Caller rsp
+    // caller rsp
     lea     rax, [rsp + 8]
     mov     [rcx + {registers_rsp}], rax
 
-    // Caller rip
+    // caller rip
     mov     rax, [rsp]
     mov     [rcx + {registers_rip}], rax
 
@@ -124,7 +124,7 @@ capture_registers:
     movaps  [rcx + {registers_xmm14}], xmm14
     movaps  [rcx + {registers_xmm15}], xmm15
 
-    // Rax is volatile across the call.
+    // rax is volatile across the call.
     xor     eax, eax
     ret
 "#,
@@ -226,7 +226,7 @@ fn setup_guest_state(guest_desc: &Descriptors, regs: &GuestRegs, vcpu: &Vcpu) ->
     vmwrite(vmcs::guest::DS_BASE, 0u64)?;
     vmwrite(vmcs::guest::ES_BASE, 0u64)?;
 
-    // Long mode
+    // long mode
     vmwrite(vmcs::guest::FS_BASE, read_msr(IA32_FS_BASE))?;
     vmwrite(vmcs::guest::GS_BASE, read_msr(IA32_GS_BASE))?;
     vmwrite(vmcs::guest::IA32_SYSENTER_CS, read_msr(IA32_SYSENTER_CS))?;
@@ -262,7 +262,7 @@ fn setup_guest_state(guest_desc: &Descriptors, regs: &GuestRegs, vcpu: &Vcpu) ->
     vmwrite(vmcs::guest::GDTR_LIMIT, u64::from(guest_desc.gdtr.limit))?;
     vmwrite(vmcs::guest::IDTR_LIMIT, u64::from(guest_desc.idtr.limit))?;
 
-    // No shadow VMCS is linked.
+    // no shadow vmcs is linked.
     vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX)?;
     Ok(())
 }
@@ -346,7 +346,7 @@ unsafe fn setup_controls(vcpu: &mut Vcpu) -> MonadResult<()> {
     vmwrite(vmcs::control::VMENTRY_CONTROLS, u64::from(controls.vmentry))?;
     vmwrite(vmcs::control::VMEXIT_CONTROLS, u64::from(controls.vmexit))?;
     vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, vcpu.msr_bitmap_pa)?;
-    // Eptp cache type is for the tables, not mapped ram
+    // eptp cache type is for the tables, not mapped ram
     vmwrite(vmcs::control::EPTP_FULL, vcpu.active_view.eptp)?;
 
     vmwrite(vmcs::control::CR0_GUEST_HOST_MASK, cr0.mask)?;
@@ -366,12 +366,12 @@ unsafe fn setup_controls(vcpu: &mut Vcpu) -> MonadResult<()> {
     Ok(())
 }
 
-/// Fills the current processor's VMCS from checked vCPU state.
+/// fills the current processor's vmcs from checked vcpu state.
 ///
 /// # Safety
 ///
-/// `vcpu` uniquely belongs to the pinned processor. Its VMCS, stack, bitmap,
-/// EPT, descriptors, and capability snapshot stay valid until VMXOFF.
+/// `vcpu` uniquely belongs to the pinned processor. its vmcs, stack, bitmap,
+/// ept, descriptors, and capability snapshot stay valid until vmxoff.
 pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) -> MonadResult<()> {
     if vcpu.is_null() {
         return Err(MonadError::new(

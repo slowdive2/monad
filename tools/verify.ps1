@@ -1,4 +1,4 @@
-# canonical local verification entry point.
+# local verification.
 
 $ErrorActionPreference = 'Stop'
 

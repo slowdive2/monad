@@ -1,4 +1,4 @@
-# Permanent checks for mailbox-driven view activation.
+# mailbox and view-switch checks.
 
 $ErrorActionPreference = 'Stop'
 

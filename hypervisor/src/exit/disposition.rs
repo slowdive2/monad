@@ -1,4 +1,4 @@
-// One typed result leaves dispatch; only the outer loop acts on it.
+// dispatch returns one result, and only the outer loop acts on it.
 
 use crate::ept::ViewId;
 use crate::exit::eventinjection::VmEntryEvent;
@@ -9,8 +9,7 @@ pub enum ExitDisposition {
     ResumeWithoutAdvance,
     Inject(VmEntryEvent),
     SwitchPublishedView(ViewId),
-    // Private lifecycle transition; ordinary vmcalls never return
-    // This variant.
+    // private lifecycle transition; normal vmcalls never return this.
     Shutdown,
     Fatal(FatalReason),
 }

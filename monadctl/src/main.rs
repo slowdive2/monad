@@ -17,15 +17,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Validate an experiment pack and print its canonical SHA-256 identity.
+    /// validate an experiment pack and print its canonical sha-256 identity.
     Validate { pack: PathBuf },
-    /// Compile a validated pack into a deterministic execution plan.
+    /// compile a validated pack into a deterministic execution plan.
     Plan {
         pack: PathBuf,
         #[arg(long)]
         compact: bool,
     },
-    /// Create the immutable preparation records for an evidence bundle.
+    /// create the immutable preparation records for an evidence bundle.
     Prepare {
         pack: PathBuf,
         output: PathBuf,

@@ -1,4 +1,4 @@
-//! Extended Page Table construction, validation, and view management.
+//! ept building, validation, and view management.
 
 mod address;
 mod backing;

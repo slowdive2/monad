@@ -15,7 +15,7 @@ struct InveptDescriptor {
 
 unsafe fn raw_invept(kind: u64, descriptor: &InveptDescriptor) -> u64 {
     let flags: u64;
-    // SAFETY: the descriptor is 16 bytes and aligned; startup checked the type.
+    // safety: the descriptor is 16 bytes and aligned; startup checked the type.
     unsafe {
         asm!(
             "invept {kind}, [{descriptor}]",
@@ -38,30 +38,30 @@ fn instruction_error(flags: u64) -> Option<u32> {
         .map(|value| value as u32)
 }
 
-/// Invalidates translations from one checked EPTP.
+/// drops cached translations for a published eptp.
 ///
 /// # Safety
 ///
-/// The caller is in VMX root with single-context INVEPT support. `eptp` names a
+/// the caller is in vmx root with single-context invept support. `eptp` names a
 /// published view.
 pub unsafe fn invept_single(eptp: u64) -> MonadResult<()> {
     let descriptor = InveptDescriptor { eptp, reserved: 0 };
-    // SAFETY: the caller and checked descriptor uphold the contract.
+    // safety: startup checked support; the eptp and descriptor are valid.
     let flags = unsafe { raw_invept(INVEPT_SINGLE_CONTEXT, &descriptor) };
     decode_vmx_status(VmxOperation::InveptSingle, flags, instruction_error(flags))
 }
 
-/// Invalidates translations from every EPTP.
+/// invalidates translations from every eptp.
 ///
 /// # Safety
 ///
-/// The caller is in VMX root with all-context INVEPT support.
+/// the caller is in vmx root with all-context invept support.
 pub unsafe fn invept_all() -> MonadResult<()> {
     let descriptor = InveptDescriptor {
         eptp: 0,
         reserved: 0,
     };
-    // SAFETY: the caller upholds the contract; the descriptor is zeroed.
+    // safety: startup checked support; all reserved bits are zero.
     let flags = unsafe { raw_invept(INVEPT_ALL_CONTEXTS, &descriptor) };
     decode_vmx_status(VmxOperation::InveptAll, flags, instruction_error(flags))
 }

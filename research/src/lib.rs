@@ -42,10 +42,10 @@ pub struct MachineSelector {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchPlan {
-    /// Zero selects Monad's documented default limit.
+    /// zero selects monad's documented default limit.
     pub aperture_limit: u64,
     pub rendezvous_timeout_tsc: u64,
-    /// Complete translated device-resource ranges that extend the RAM-derived
+    /// complete translated device-resource ranges that extend the ram-derived
     /// physical inventory.
     pub device_ranges: Vec<DeviceRange>,
 }

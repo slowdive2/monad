@@ -1,5 +1,5 @@
-// Vmcalls are private transitions from known cpl0 rendezvous callbacks.
-// Guest registers never carry an operation, pointer, or service value.
+// vmcalls only come from known cpl0 rendezvous callbacks.
+// guest registers never carry commands, pointers, or service data.
 
 #[cfg(not(test))]
 use wdk_sys::{ntddk::KeGetCurrentProcessorNumberEx, PROCESSOR_NUMBER};
@@ -31,7 +31,7 @@ impl ViewSwitchBackend for HardwareSwitch {
             | SwitchStep::InvalidateTarget
             | SwitchStep::InvalidateFailedTarget
             | SwitchStep::InvalidateRestoredOld => {
-                // SAFETY: the capability gate requires single-context invept.
+                // safety: the capability gate requires single-context invept.
                 unsafe { invept_single(eptp) }
             }
         }
@@ -41,7 +41,7 @@ impl ViewSwitchBackend for HardwareSwitch {
 #[cfg(not(test))]
 fn current_cpu(expected: CpuId) -> CpuId {
     let mut native = PROCESSOR_NUMBER::default();
-    // SAFETY: native is a writable processor-number output.
+    // safety: native is a writable processor-number output.
     unsafe { KeGetCurrentProcessorNumberEx(&mut native) };
     CpuId {
         dense_index: expected.dense_index,
@@ -56,14 +56,14 @@ fn current_cpu(expected: CpuId) -> CpuId {
     expected
 }
 
-/// Handles one private shutdown VMCALL.
+/// handles one private shutdown vmcall.
 ///
 /// # Safety
 ///
-/// The caller is in VMX root with this vCPU's VMCS current and exclusive access.
-/// Only its rendezvous callback may arm the mailbox.
+/// the caller is in vmx root with this vcpu's vmcs current and exclusive access.
+/// only its rendezvous callback may arm the mailbox.
 pub(super) unsafe fn handle(vcpu: &mut Vcpu) -> ExitDisposition {
-    // CS.RPL equals CPL. A nonzero RPL means user mode and receives #UD.
+    // cs.rpl equals cpl. a nonzero rpl means user mode and receives #ud.
     let cs = match vmread(vmcs::guest::CS_SELECTOR) {
         Ok(v) => v,
         Err(_) => return ExitDisposition::Fatal(FatalReason::VmreadFailure),
@@ -124,7 +124,7 @@ mod tests {
     fn public_vmcall_is_ud() {
         let mailbox = InternalMailbox::new();
 
-        // Guest register noise cannot affect the private mailbox.
+        // guest register noise cannot affect the private mailbox.
         for guest_value in [0, 1, u32::MAX as u64, u64::MAX] {
             let regs = crate::arch::intel::vmcs::GuestRegs {
                 rax: guest_value,

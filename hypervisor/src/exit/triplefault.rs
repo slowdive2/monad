@@ -1,5 +1,4 @@
-// A triple fault enters fatal policy; it never resets the chipset or
-// Attempts a local shutdown.
+// triple faults are fatal. don't reset the chipset or shut down locally here.
 
 use crate::vmm::Vcpu;
 

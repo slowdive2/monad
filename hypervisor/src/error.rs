@@ -69,25 +69,25 @@ pub enum ErrorCode {
 pub struct MonadError {
     pub phase: ErrorPhase,
     pub code: ErrorCode,
-    /// Dense CPU index, or the no-CPU sentinel.
+    /// dense cpu index, or the no-cpu sentinel.
     pub cpu_dense_index: u16,
-    /// Always zero; reject nonzero input.
+    /// always zero; reject nonzero input.
     pub reserved: u16,
-    /// Batch index, or the no-operation sentinel.
+    /// batch index, or the no-operation sentinel.
     pub operation_index: u32,
-    /// Stable detail for this code:
+    /// stable detail for this code:
     ///
     /// - capability failures name the required feature; impossible controls
     ///   put the field in bits 32..39 and the rejected control mask in bits
     ///   0..31;
-    /// - VMX failures put operation in bits 0..7, status in bits 8..15, and the
+    /// - vmx failures put operation in bits 0..7, status in bits 8..15, and the
     ///   instruction error in bits 32..63 (all ones means unavailable);
-    /// - address, guest-state, and CPU-set failures use their named detail;
+    /// - address, guest-state, and cpu-set failures use their named detail;
     /// - capacity failures contain the rejected count, physical-width failure
     ///   contains the rejected width, and generation overflow contains the
     ///   previous generation;
     /// - fields rejected for being reserved/nonzero contain the rejected value;
-    /// - otherwise detail is zero unless the producing API defines a more
+    /// - otherwise detail is zero unless the producing api defines a more
     ///   specific value.
     pub detail: u64,
 }

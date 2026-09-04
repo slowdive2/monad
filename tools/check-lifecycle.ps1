@@ -1,4 +1,4 @@
-# Permanent checks for lifecycle, extended state, and fatal behavior.
+# lifecycle and teardown checks.
 
 $ErrorActionPreference = 'Stop'
 
