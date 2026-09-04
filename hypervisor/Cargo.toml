@@ -1,0 +1,16 @@
+# hypervisor/Cargo.toml
+[package]
+name = "hypervisor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+x86 = "0.52"
+bit_field = "0.10"
+bitflags = "2"
+log = "0.4"
+wdk-sys = "0.3"
+windows-sys = { version = "0.59", features = ["Wdk_System_SystemServices"] }
+
+[lib]
+crate-type = ["rlib"]

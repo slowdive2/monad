@@ -1,0 +1,9 @@
+[workspace]
+members = ["hypervisor", "driver", "research", "monadctl"]
+resolver = "2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

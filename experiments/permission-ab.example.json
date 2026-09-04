@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "experiment_id": "permission-ab-example",
+  "research_question": "Does removing write permission from one page produce only the predicted EPT write violations?",
+  "hypothesis": "The treatment view produces matching write violations while the base control does not.",
+  "source_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "machine": {
+    "machine_id": "replace-with-lab-machine-id",
+    "windows_build": "replace-with-exact-windows-build",
+    "cpu_model": "replace-with-family-model-stepping",
+    "microcode": "replace-with-microcode-revision"
+  },
+  "launch": {
+    "aperture_limit": 549755813888,
+    "rendezvous_timeout_tsc": 17179869184,
+    "device_ranges": [
+      {
+        "start": 4273995776,
+        "length": 4096
+      }
+    ]
+  },
+  "views": [
+    {
+      "name": "read-only",
+      "source": "base",
+      "edits": [
+        {
+          "action": "set_permissions",
+          "gpa": 8192,
+          "length": 4096,
+          "permissions": 5
+        }
+      ]
+    }
+  ],
+  "schedule": [
+    {
+      "view": "base",
+      "cpu_dense_indices": [0],
+      "dwell_ms": 100
+    },
+    {
+      "view": "read-only",
+      "cpu_dense_indices": [0],
+      "dwell_ms": 100
+    },
+    {
+      "view": "base",
+      "cpu_dense_indices": [0],
+      "dwell_ms": 100
+    }
+  ],
+  "trigger": {
+    "program": "ground-truth-trigger.exe",
+    "args": ["bounded-write"],
+    "timeout_ms": 5000
+  },
+  "expected_outcomes": [
+    {
+      "name": "write-violation",
+      "oracle": "Monad event records for the selected GPA and activation epoch",
+      "predicate": "zero matching exits in base steps and at least one matching write exit in the treatment step"
+    }
+  ],
+  "repetitions": 30,
+  "stop": {
+    "max_failures": 3,
+    "max_dropped_events": 0,
+    "abort_on_fatal": true,
+    "max_duration_ms": 900000
+  }
+}
