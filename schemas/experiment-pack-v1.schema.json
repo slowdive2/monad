@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://monad.invalid/schemas/experiment-pack-v1.schema.json",
+  "title": "Monad experiment pack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "experiment_id",
+    "research_question",
+    "hypothesis",
+    "source_sha256",
+    "machine",
+    "launch",
+    "views",
+    "schedule",
+    "trigger",
+    "expected_outcomes",
+    "repetitions",
+    "stop"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "experiment_id": { "$ref": "#/$defs/id" },
+    "research_question": { "type": "string", "minLength": 1 },
+    "hypothesis": { "type": "string", "minLength": 1 },
+    "source_sha256": { "$ref": "#/$defs/sha256" },
+    "machine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["machine_id", "windows_build", "cpu_model", "microcode"],
+      "properties": {
+        "machine_id": { "type": "string", "minLength": 1 },
+        "windows_build": { "type": "string", "minLength": 1 },
+        "cpu_model": { "type": "string", "minLength": 1 },
+        "microcode": { "type": "string", "minLength": 1 }
+      }
+    },
+    "launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["aperture_limit", "rendezvous_timeout_tsc", "device_ranges"],
+      "properties": {
+        "aperture_limit": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 281474976710656
+        },
+        "rendezvous_timeout_tsc": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "device_ranges": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/range" }
+        }
+      }
+    },
+    "views": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "source", "edits"],
+        "properties": {
+          "name": { "$ref": "#/$defs/id" },
+          "source": { "$ref": "#/$defs/id" },
+          "edits": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/$defs/edit" }
+          }
+        }
+      }
+    },
+    "schedule": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["view", "cpu_dense_indices", "dwell_ms"],
+        "properties": {
+          "view": { "$ref": "#/$defs/id" },
+          "cpu_dense_indices": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            }
+          },
+          "dwell_ms": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program", "args", "timeout_ms"],
+      "properties": {
+        "program": { "type": "string", "minLength": 1 },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "timeout_ms": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "expected_outcomes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "oracle", "predicate"],
+        "properties": {
+          "name": { "$ref": "#/$defs/id" },
+          "oracle": { "type": "string", "minLength": 1 },
+          "predicate": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "repetitions": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000
+    },
+    "stop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_failures",
+        "max_dropped_events",
+        "abort_on_fatal",
+        "max_duration_ms"
+      ],
+      "properties": {
+        "max_failures": { "type": "integer", "minimum": 1 },
+        "max_dropped_events": { "type": "integer", "minimum": 0 },
+        "abort_on_fatal": { "type": "boolean" },
+        "max_duration_ms": { "type": "integer", "minimum": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.-]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "length"],
+      "properties": {
+        "start": { "type": "integer", "minimum": 0 },
+        "length": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "edit": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "gpa", "length", "permissions"],
+          "properties": {
+            "action": { "const": "set_permissions" },
+            "gpa": { "type": "integer", "minimum": 0 },
+            "length": { "type": "integer", "minimum": 1 },
+            "permissions": { "type": "integer", "minimum": 0, "maximum": 7 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "gpa", "length"],
+          "properties": {
+            "action": { "const": "restore_from_base" },
+            "gpa": { "type": "integer", "minimum": 0 },
+            "length": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "gpa",
+            "length",
+            "artifact",
+            "artifact_sha256",
+            "permissions",
+            "memory_type"
+          ],
+          "properties": {
+            "action": { "const": "map_backing4k" },
+            "gpa": { "type": "integer", "minimum": 0 },
+            "length": { "type": "integer", "minimum": 1 },
+            "artifact": { "type": "string", "minLength": 1 },
+            "artifact_sha256": { "$ref": "#/$defs/sha256" },
+            "permissions": { "type": "integer", "minimum": 0, "maximum": 7 },
+            "memory_type": { "enum": [0, 1, 4, 5, 6] }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+# pinned toolchain for monad research base 0.1.
+# 1.97.1 parses this lockfile and its edition 2024 dependencies.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["x86_64-pc-windows-msvc"]
+profile = "minimal"
