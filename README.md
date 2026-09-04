@@ -5,6 +5,9 @@ address translation on a running x86-64 Windows system.
 
 at its core...: build and verify a complete EPT view before use by a processor, then the published hierarchy is immutable in place
 
+monad is a consolidation of arrow-base (ideas/implementations of a base hypervisor spanning 2026 til sept 2026) : therefore , this substrate 
+initially committed as one monolithic import. actual qualification/research has been tracked incrementally from there
+
 the current base includes:
 
 - typed VMX, VMCS, CPU-state, and capability boundaries;
