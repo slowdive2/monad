@@ -508,25 +508,24 @@ struct AffinityGuard {
 
 impl Drop for AffinityGuard {
     fn drop(&mut self) {
-        // SAFETY: the matching affinity call initialized `previous`.
-        // On this thread and is reverted exactly once by this guard.
+        // safety: `previous` came from the affinity call on this thread.
         unsafe { KeRevertToUserGroupAffinityThread(&mut self.previous) };
     }
 }
 
 fn pin_to_processor(cpu: CpuId) -> MonadResult<AffinityGuard> {
-    // SAFETY: these pod values allow zero initialization.
+    // safety: these pod values allow zero initialization.
     let mut target = unsafe { core::mem::zeroed::<GROUP_AFFINITY>() };
-    // SAFETY: the affinity call fills this zeroable pod before guard creation.
+    // safety: the affinity call fills this zeroable pod before guard creation.
     let mut previous = unsafe { core::mem::zeroed::<GROUP_AFFINITY>() };
     target.Group = cpu.group;
     target.Mask = (1 as KAFFINITY) << cpu.number;
-    // SAFETY: the active topology supplied the target; this runs at passive_level.
+    // safety: the active topology supplied the target; this runs at passive_level.
     unsafe { KeSetSystemGroupAffinityThread(&mut target, &mut previous) };
     let guard = AffinityGuard { previous };
 
     let mut current = PROCESSOR_NUMBER::default();
-    // SAFETY: `current` is writable output storage.
+    // safety: `current` is writable output storage.
     unsafe { KeGetCurrentProcessorNumberEx(&mut current) };
     if current.Group != cpu.group || current.Number != cpu.number {
         return Err(MonadError::new(
@@ -634,14 +633,14 @@ fn accumulate_processor_capabilities(
     Ok(())
 }
 
-/// Collects and validates the fixed platform state before VMX.
+/// reads and checks the platform state needed before vmx.
 ///
-/// Call once at `PASSIVE_LEVEL` during VMM preparation. It pins the caller to
+/// call once at `PASSIVE_LEVEL` during vmm preparation. it pins the caller to
 /// each processor and reads every capability register exactly once for that
 /// processor before returning one homogeneous platform snapshot.
 pub fn collect_capabilities() -> MonadResult<ValidatedPlatform> {
-    // SAFETY: this pointer-free read only rejects an
-    // Invalid caller context before any other platform operation.
+    // safety: this pointer-free read only rejects an
+    // invalid caller context before any other platform operation.
     if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL {
         return Err(MonadError::new(
             ErrorPhase::Capability,

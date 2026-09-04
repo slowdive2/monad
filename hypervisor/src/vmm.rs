@@ -154,7 +154,7 @@ pub struct Vcpu {
     pub(crate) original_controls: OriginalControlRegisters,
     pub(crate) original_debug: crate::lifecycle::DebugState,
     pub(crate) cpu: CpuId,
-    // True until vmxoff succeeds; teardown waits on this before freeing
+    // teardown waits for vmxoff before freeing this vcpu.
     active: AtomicBool,
 }
 
@@ -221,7 +221,7 @@ impl ActiveViewReport {
 type ProductionViewManager = EptViewManager<WindowsPageAllocator>;
 
 struct Vmm {
-    // Exallocatepool2 zeroes memory by default
+    // exallocatepool2 returns zeroed memory.
     cpu_count: u32,
     vcpus: *mut *mut Vcpu,
     manager: *mut ProductionViewManager,
@@ -681,65 +681,65 @@ fn running_manager() -> MonadResult<*mut ProductionViewManager> {
     Ok(manager)
 }
 
-/// Allocates controller-owned backing pages.
+/// allocates backing pages owned by the controller.
 ///
 /// # Safety
 ///
-/// The caller holds the single controller serialization token at passive level.
+/// caller holds the controller token at passive level.
 pub unsafe fn allocate_backing(page_count: u32, immutable: bool) -> MonadResult<BackingId> {
     unsafe { &mut *running_manager()? }.allocate_backing(page_count, immutable)
 }
 
-/// Writes bytes into one mutable backing object.
+/// writes bytes into mutable backing.
 ///
 /// # Safety
 ///
-/// The caller holds the single controller serialization token at passive level.
+/// caller holds the controller token at passive level.
 pub unsafe fn write_backing(id: BackingId, offset: usize, data: &[u8]) -> MonadResult<()> {
     unsafe { &mut *running_manager()? }.write_backing(id, offset, data)
 }
 
-/// Frees one unreferenced backing object.
+/// frees unreferenced backing.
 ///
 /// # Safety
 ///
-/// The caller holds the single controller serialization token at passive level.
+/// caller holds the controller token at passive level.
 pub unsafe fn free_backing(id: BackingId) -> MonadResult<()> {
     unsafe { &mut *running_manager()? }.free_backing(id)
 }
 
-/// Deep-clones a published view into a controller draft.
+/// clones a published view into a draft.
 ///
 /// # Safety
 ///
-/// The caller holds the single controller serialization token at passive level.
+/// caller holds the controller token at passive level.
 pub unsafe fn create_draft(source: ViewId) -> MonadResult<DraftId> {
     unsafe { &mut *running_manager()? }.create_draft(source)
 }
 
-/// Atomically applies one checked edit batch to a draft.
+/// applies the whole edit batch or leaves the draft alone.
 ///
 /// # Safety
 ///
-/// The caller holds the single controller serialization token at passive level.
+/// caller holds the controller token at passive level.
 pub unsafe fn apply_edit_batch(id: DraftId, edits: &[DraftEdit]) -> MonadResult<()> {
     unsafe { &mut *running_manager()? }.apply_batch(id, edits)
 }
 
-/// Discards one controller draft.
+/// drops a draft.
 ///
 /// # Safety
 ///
-/// The caller holds the single controller serialization token at passive level.
+/// caller holds the controller token at passive level.
 pub unsafe fn discard_draft(id: DraftId) -> MonadResult<()> {
     unsafe { &mut *running_manager()? }.discard_draft(id)
 }
 
-/// Verifies and pins one draft as an immutable published view.
+/// checks a draft, publishes it, and pins its tables.
 ///
 /// # Safety
 ///
-/// The caller holds the single controller serialization token at passive level.
+/// caller holds the controller token at passive level.
 pub unsafe fn publish_view(id: DraftId) -> MonadResult<ViewId> {
     let manager = running_manager()?;
     let view = unsafe { &mut *manager }.publish_draft(id)?;
@@ -755,20 +755,20 @@ pub unsafe fn publish_view(id: DraftId) -> MonadResult<ViewId> {
     Ok(view)
 }
 
-/// Walks one immutable published view in software.
+/// walks an immutable view in software.
 ///
 /// # Safety
 ///
-/// The caller holds the controller serialization token at passive level.
+/// the caller holds the controller serialization token at passive level.
 pub unsafe fn query_view(id: ViewId, gpa: GuestPhysicalAddress) -> MonadResult<WalkResult> {
     unsafe { &*running_manager()? }.walk(id, gpa)
 }
 
-/// Walks one unpublished draft in software.
+/// walks a draft in software.
 ///
 /// # Safety
 ///
-/// The caller holds the controller serialization token at passive level.
+/// the caller holds the controller serialization token at passive level.
 pub unsafe fn query_draft(id: DraftId, gpa: GuestPhysicalAddress) -> MonadResult<WalkResult> {
     unsafe { &*running_manager()? }.walk_draft(id, gpa)
 }
@@ -806,11 +806,11 @@ impl Default for PublicViewState {
     }
 }
 
-/// Snapshots fixed public metadata for pinned views.
+/// copies public metadata for pinned views.
 ///
 /// # Safety
 ///
-/// The caller holds the controller serialization token at passive level.
+/// the caller holds the controller serialization token at passive level.
 pub unsafe fn list_views(output: &mut [PublicViewState]) -> MonadResult<(usize, usize)> {
     let manager = unsafe { &*running_manager()? };
     let mut ids = [ViewId {
@@ -910,11 +910,11 @@ pub fn aperture_end() -> MonadResult<u64> {
     unsafe { &*manager }.aperture_end()
 }
 
-/// Atomically activates one pinned view on a checked CPU set.
+/// switches the selected cpus to a pinned view as one transaction.
 ///
 /// # Safety
 ///
-/// The caller holds the single controller serialization token at passive level.
+/// caller holds the controller token at passive level.
 pub unsafe fn activate_view(id: ViewId, cpu_set: &[CpuSetWord]) -> MonadResult<()> {
     let manager = unsafe { &*running_manager()? };
     let view = manager.published_view(id)?;
@@ -961,7 +961,7 @@ unsafe extern "C" fn shutdown_cpu(context: u64) -> u64 {
         return 1;
     }
 
-    // SAFETY: this is the registered ipi callback and the mailbox is prepared.
+    // safety: this is the registered ipi callback and the mailbox is prepared.
     unsafe { rendezvous_vmcall() };
     u64::from(!unsafe { (*vcpu).active.load(Ordering::Acquire) })
 }
@@ -1023,7 +1023,7 @@ struct ActivationContext {
 
 #[cfg(not(test))]
 fn fatal_rendezvous(cpu: u16, detail: u64) -> ! {
-    // SAFETY: this terminal path uses stable Monad bugcheck parameters.
+    // safety: this terminal path uses stable monad bugcheck parameters.
     unsafe {
         KeBugCheckEx(
             MONAD_BUGCHECK_CODE,
@@ -1057,7 +1057,7 @@ unsafe extern "C" fn activate_cpu(context: u64) -> u64 {
     }
 
     if transaction.is_target(dense) {
-        // SAFETY: passive control prepared this vCPU's mailbox.
+        // safety: passive control prepared this vcpu's mailbox.
         unsafe { rendezvous_vmcall() };
         let switched = unsafe { (*vcpu).active_view == activation.target };
         let status = unsafe { (*vcpu).mailbox.status() };
@@ -1098,7 +1098,7 @@ unsafe extern "C" fn activate_cpu(context: u64) -> u64 {
         {
             transaction.fatal.store(true, Ordering::Release);
         } else {
-            // SAFETY: this callback owns the matching prepared mailbox.
+            // safety: this callback owns the matching prepared mailbox.
             unsafe { rendezvous_vmcall() };
             if unsafe { (*vcpu).active_view } != old {
                 transaction.fatal.store(true, Ordering::Release);
@@ -1122,11 +1122,11 @@ unsafe extern "C" fn activate_cpu(context: u64) -> u64 {
     1
 }
 
-/// Installs one pinned published view on a checked processor set.
+/// switches the selected processors to a pinned view.
 ///
 /// # Safety
 ///
-/// The caller runs at `PASSIVE_LEVEL`, keeps `view` pinned through VMM teardown,
+/// the caller runs at `PASSIVE_LEVEL`, keeps `view` pinned through vmm teardown,
 /// and serializes publication and lifecycle requests.
 pub unsafe fn activate_published_view<A: crate::ept::EptPageAllocator + Clone>(
     view: &crate::ept::PublishedView<A>,
@@ -1436,7 +1436,7 @@ unsafe extern "C" fn launch_cpu(context: u64) -> u64 {
         {
             launch.fatal.store(true, Ordering::Release);
         } else {
-            // SAFETY: this callback owns the prepared rollback mailbox.
+            // safety: this callback owns the prepared rollback mailbox.
             unsafe { rendezvous_vmcall() };
             if unsafe { (*vcpu).active.load(Ordering::Acquire) } {
                 launch.fatal.store(true, Ordering::Release);
@@ -1462,12 +1462,12 @@ unsafe extern "C" fn launch_cpu(context: u64) -> u64 {
     1
 }
 
-/// Stops every virtual processor and releases the VMM ownership graph.
+/// stops all vcpus and frees vmm-owned state.
 ///
 /// # Safety
 ///
-/// The caller runs at `PASSIVE_LEVEL` and does not independently change VMX
-/// state on these processors. It must prevent new hypervisor client work from
+/// the caller runs at `PASSIVE_LEVEL` and does not independently change vmx
+/// state on these processors. it must prevent new hypervisor client work from
 /// beginning during driver teardown.
 pub unsafe fn vmm_shutdown() -> MonadResult<()> {
     let lifecycle_guard = LIFECYCLE.try_control()?;
@@ -1510,12 +1510,11 @@ pub unsafe fn vmm_shutdown() -> MonadResult<()> {
     Ok(())
 }
 
-/// Allocates and launches the VMM on the startup processor snapshot. Later
-/// processors stay native.
+/// starts the vmm on the startup cpu snapshot. later cpus stay native.
 ///
 /// # Safety
 ///
-/// The caller runs at `PASSIVE_LEVEL` and exclusively owns VMX startup.
+/// the caller runs at `PASSIVE_LEVEL` and exclusively owns vmx startup.
 pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
     let lifecycle_guard = LIFECYCLE.try_control()?;
     lifecycle_guard.transition(LifecycleState::Absent, LifecycleState::Preparing)?;
@@ -1630,7 +1629,7 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         ));
     }
 
-    // Allocate each vCPU first.
+    // allocate every vcpu before starting vmx.
     let mut alloc_failed = false;
     for i in 0..cpu_count {
         let Some(cpu) = (unsafe { (*ctx).topology.get(i as u16) }) else {
@@ -1663,7 +1662,7 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         ));
     }
 
-    // This is the last preparation check before the first vmxon.
+    // last topology check before vmxon.
     match snapshot_active_processors() {
         Ok(topology) if unsafe { (*ctx).topology.same_identity(&topology) } => {}
         Ok(_) => {
@@ -1828,7 +1827,7 @@ unsafe fn stop_cpu(vcpu: *mut Vcpu) -> ! {
 
     unsafe { vmxoff_or_fatal(vcpu) };
 
-    // After VMXOFF, hardware cannot reach this vCPU's VMX resources.
+    // vmxoff makes this vcpu unreachable to hardware.
     unsafe { (*vcpu).active.store(false, Ordering::Release) };
 
     unsafe {
@@ -1871,12 +1870,12 @@ unsafe fn fatal_vmexit(_vcpu: *mut Vcpu, reason: FatalReason) -> ! {
 }
 
 #[unsafe(no_mangle)]
-/// Runs one vCPU's non-returning root dispatch loop.
+/// runs the root vm-exit loop for this vcpu.
 ///
 /// # Safety
 ///
-/// Monad's VM-exit assembly enters on `vcpu`'s root stack. That live vCPU is
-/// exclusively owned and its VMCS is current.
+/// monad's vm-exit assembly enters on `vcpu`'s root stack. that live vcpu is
+/// exclusively owned and its vmcs is current.
 pub(crate) unsafe extern "win64" fn vmexit_handler(vcpu: *mut Vcpu) -> ! {
     loop {
         match unsafe { handle(&mut *vcpu) } {
@@ -1948,7 +1947,7 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
         }
     };
     (*vcpu).guest_desc = guest_desc;
-    // No separate host address space yet
+    // the host still shares the guest's address space.
     let host_desc = match unsafe { Descriptors::capture_current() } {
         Ok(descriptors) => descriptors,
         Err(error) => {
@@ -1974,7 +1973,7 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
         }
     }
 
-    // Hardware may use every reachable VMX allocation until VMXOFF.
+    // hardware may touch vmx allocations until vmxoff.
     unsafe { (*vcpu).active.store(true, Ordering::Release) };
     if let Err(error) = unsafe { vmlaunch(&mut (*vcpu).regs) } {
         log::error!("VMLAUNCH failed on processor {cpu}: {error:?}");

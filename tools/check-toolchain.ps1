@@ -1,6 +1,6 @@
-# Fail clearly if the pinned wdk is missing. the installed product includes
-# Qfe 10.1.26100.6584; its kit directories use
-# The build-family path 10.0.26100.0.
+# fail clearly if the pinned wdk is missing. the installed product includes
+# qfe 10.1.26100.6584; its kit directories use
+# the build-family path 10.0.26100.0.
 
 $ErrorActionPreference = 'Stop'
 
@@ -50,6 +50,6 @@ if ($clangVersionLine -notmatch "clang version $([regex]::Escape($llvmVersion))(
     throw "expected LLVM clang $llvmVersion at $clangPath; found: $clangVersionLine"
 }
 
-# Bindgen 0.69 misses libclang in the winget location sometimes.
-# Set it here so cargo and its build scripts inherit it.
+# bindgen 0.69 misses libclang in the winget location sometimes.
+# set it here so cargo and its build scripts inherit it.
 $env:LIBCLANG_PATH = $libclangDirectory

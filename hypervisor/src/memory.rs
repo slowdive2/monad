@@ -1,4 +1,4 @@
-//! Windows physical-memory discovery used to size the identity EPT view.
+//! windows ram discovery for the identity ept view.
 
 extern crate alloc;
 
@@ -12,25 +12,25 @@ use windows_sys::Wdk::System::SystemServices::{
 use crate::ept::{PhysicalRange, PhysicalRangeKind, RequiredPhysicalRange};
 use crate::error::{ErrorCode, ErrorPhase, MonadError, MonadResult};
 
-/// Owns the pool allocation returned by `MmGetPhysicalMemoryRangesEx2`.
+/// owns the pool allocation returned by `MmGetPhysicalMemoryRangesEx2`.
 struct PhysicalMemoryRanges(*mut PHYSICAL_MEMORY_RANGE);
 
 impl Drop for PhysicalMemoryRanges {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            // SAFETY: Windows returns a single pool allocation that must be
-            // Released with ExFreePool after the zero-terminated array is read.
+            // safety: windows returns a single pool allocation that must be
+            // released with exfreepool after the zero-terminated array is read.
             unsafe { ExFreePool(self.0.cast()) };
         }
     }
 }
 
-/// Combines the Windows RAM snapshot with controller-supplied device ranges.
+/// combines the windows ram snapshot with controller-supplied device ranges.
 pub(crate) fn collect_physical_inventory(
     device_ranges: &[PhysicalRange],
 ) -> MonadResult<(Vec<PhysicalRange>, Vec<RequiredPhysicalRange>)> {
-    // SAFETY: A null partition selects the current system partition. Zero
-    // Flags request the documented snapshot form of the API.
+    // safety: a null partition selects the current system partition. zero
+    // flags request the documented snapshot form of the api.
     let allocation = PhysicalMemoryRanges(unsafe { MmGetPhysicalMemoryRangesEx2(null_mut(), 0) });
     if allocation.0.is_null() {
         return Err(MonadError::new(
@@ -51,7 +51,7 @@ pub(crate) fn collect_physical_inventory(
 
     let mut index = 0usize;
     loop {
-        // SAFETY: The documented result is a zero-terminated array owned by
+        // safety: the documented result is a zero-terminated array owned by
         // `allocation`, which remains alive for the duration of this loop.
         let range = unsafe { *allocation.0.add(index) };
         if range.BaseAddress == 0 && range.NumberOfBytes == 0 {

@@ -196,11 +196,11 @@ fn switch_local_view(vcpu: &mut Vcpu, view: crate::ept::ViewId) -> Result<(), Fa
     Ok(())
 }
 
-/// Dispatches one exit for the current vCPU.
+/// dispatches one exit for the current vcpu.
 ///
 /// # Safety
 ///
-/// The caller runs on `vcpu`'s root stack with its VMCS current and exclusive
+/// the caller runs on `vcpu`'s root stack with its vmcs current and exclusive
 /// mutable access.
 pub unsafe fn handle(vcpu: &mut Vcpu) -> VmExitAction {
     let context = match capture(vcpu) {

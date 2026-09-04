@@ -1,4 +1,3 @@
-# hypervisor/Cargo.toml
 [package]
 name = "hypervisor"
 version = "0.1.0"

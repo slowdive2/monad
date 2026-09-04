@@ -1,4 +1,4 @@
-# VM-exit fault-policy and telemetry gate.
+# vm-exit fault and telemetry checks.
 
 $ErrorActionPreference = 'Stop'
 

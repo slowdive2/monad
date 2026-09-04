@@ -1,4 +1,4 @@
-# Permanent scope and legacy-surface checks.
+# stale code checks.
 
 $ErrorActionPreference = 'Stop'
 

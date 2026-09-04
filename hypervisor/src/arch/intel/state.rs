@@ -9,7 +9,7 @@ use x86::{
 use crate::error::{ErrorCode, ErrorPhase, MonadError, MonadResult};
 
 pub fn read_tsc() -> u64 {
-    // SAFETY: rdtsc has no memory operand and is available on x86-64.
+    // safety: rdtsc has no memory operand and is available on x86-64.
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
@@ -43,25 +43,25 @@ pub struct Descriptors {
 }
 
 impl Descriptors {
-    /// Captures descriptor state for the current processor.
+    /// captures descriptor state for the current processor.
     ///
     /// # Safety
     ///
-    /// The caller stays at CPL0 on one processor. The active GDT stays readable.
+    /// the caller stays at cpl0 on one processor. the active gdt stays readable.
     pub unsafe fn capture_current() -> MonadResult<Self> {
         let mut gdtr = DescriptorTablePointer::default();
         let mut idtr = DescriptorTablePointer::default();
-        // SAFETY: the caller guarantees cpl 0 and processor stability; both output
-        // Pointers refer to initialized writable stack storage.
+        // safety: the caller guarantees cpl 0 and processor stability; both output
+        // pointers refer to initialized writable stack storage.
         unsafe {
             sgdt(&mut gdtr);
             sidt(&mut idtr);
         }
 
-        // SAFETY: the caller guarantees cpl 0 and processor stability.
+        // safety: the caller guarantees cpl 0 and processor stability.
         let tr = unsafe { read_tr() };
-        // SAFETY: the captured gdt stays readable; bounds are
-        // Validated before either descriptor slot is dereferenced.
+        // safety: the captured gdt stays readable; bounds are
+        // validated before either descriptor slot is dereferenced.
         let (tss_base, tss_limit, tss_access_rights) =
             unsafe { read_tss_checked(gdtr.base, gdtr.limit, tr)? };
 
@@ -78,7 +78,7 @@ impl Descriptors {
 
 unsafe fn read_tr() -> SegmentSelector {
     let selector: u16;
-    // SAFETY: str is available at cpl 0 and only writes the selected register.
+    // safety: str is available at cpl 0 and only writes the selected register.
     unsafe {
         asm!(
             "str {selector:x}",
@@ -163,7 +163,7 @@ unsafe fn read_tss_checked(
                 StateErrorDetail::DescriptorAddressOverflow,
             )
         })?;
-    // SAFETY: both full slots are inside the readable captured gdt.
+    // safety: both full slots are inside the readable captured gdt.
     let (low, high) = unsafe {
         (
             (low_address as *const u64).read_unaligned(),
@@ -186,16 +186,16 @@ pub fn segment_access_from_lar(selector: u16, lar_result: Option<u32>) -> u32 {
     if selector & !0x3 == 0 || lar_result.is_none() {
         return SEGMENT_UNUSABLE;
     }
-    // LAR defines only the access byte and AVL/L/DB/G nibble used by the VMCS.
-    // The mask keeps undefined destination bits from becoming
-    // Reserved-one guest-state bits.
+    // lar defines only the access byte and avl/l/db/g nibble used by the vmcs.
+    // the mask keeps undefined destination bits from becoming
+    // reserved-one guest-state bits.
     (lar_result.unwrap_or(0) >> 8) & 0xf0ff
 }
 
 pub(crate) fn lar(selector: SegmentSelector) -> Option<u32> {
     let access_rights: u64;
     let flags: u64;
-    // SAFETY: lar is valid here; zf reports an inaccessible selector.
+    // safety: lar is valid here; zf reports an inaccessible selector.
     unsafe {
         asm!(
             "lar {access_rights}, {selector}",
@@ -214,7 +214,7 @@ pub(crate) fn lar(selector: SegmentSelector) -> Option<u32> {
 pub(crate) fn lsl(selector: SegmentSelector) -> Option<u32> {
     let limit: u64;
     let flags: u64;
-    // SAFETY: lsl is valid here; zf reports an inaccessible selector.
+    // safety: lsl is valid here; zf reports an inaccessible selector.
     unsafe {
         asm!(
             "lsl {limit}, {selector}",
@@ -276,67 +276,67 @@ pub fn normalize_control_state(
 }
 
 pub(crate) fn read_msr(msr: u32) -> u64 {
-    // SAFETY: capability checks cover the msr and the caller runs at cpl 0.
+    // safety: capability checks cover the msr and the caller runs at cpl 0.
     unsafe { x86::msr::rdmsr(msr) }
 }
 
 pub(crate) fn write_msr(msr: u32, value: u64) {
-    // SAFETY: the caller selects a writable msr and runs at cpl 0.
+    // safety: the caller selects a writable msr and runs at cpl 0.
     unsafe { x86::msr::wrmsr(msr, value) };
 }
 
 pub(crate) fn read_cr0() -> u64 {
-    // SAFETY: Monad calls this only from CPL0 kernel context.
+    // safety: monad calls this only from cpl0 kernel context.
     unsafe { x86::controlregs::cr0().bits() as u64 }
 }
 
 pub(crate) fn write_cr0(value: u64) {
-    // SAFETY: VMX fixed masks validated the value.
+    // safety: vmx fixed masks validated the value.
     unsafe {
         x86::controlregs::cr0_write(x86::controlregs::Cr0::from_bits_truncate(value as usize))
     };
 }
 
 pub(crate) fn read_cr3() -> u64 {
-    // SAFETY: Monad calls this only from CPL0 kernel context.
+    // safety: monad calls this only from cpl0 kernel context.
     unsafe { x86::controlregs::cr3() }
 }
 
 pub(crate) fn write_cr3(value: u64) {
-    // SAFETY: this is a captured active cr3.
+    // safety: this is a captured active cr3.
     unsafe { x86::controlregs::cr3_write(value) };
 }
 
 pub(crate) fn read_cr4() -> u64 {
-    // SAFETY: Monad calls this only from CPL0 kernel context.
+    // safety: monad calls this only from cpl0 kernel context.
     unsafe { x86::controlregs::cr4().bits() as u64 }
 }
 
 pub(crate) fn write_cr4(value: u64) {
-    // SAFETY: VMX fixed masks validated the value.
+    // safety: vmx fixed masks validated the value.
     unsafe {
         x86::controlregs::cr4_write(x86::controlregs::Cr4::from_bits_truncate(value as usize))
     };
 }
 
 pub(crate) fn read_dr7() -> u64 {
-    // SAFETY: Monad calls this only from CPL0 kernel context.
+    // safety: monad calls this only from cpl0 kernel context.
     unsafe { x86::debugregs::dr7().0 as u64 }
 }
 
 pub(crate) fn write_dr7(value: u64) {
-    // SAFETY: this value came from captured guest state.
+    // safety: this value came from captured guest state.
     unsafe { x86::debugregs::dr7_write(x86::debugregs::Dr7(value as usize)) };
 }
 
-/// Captures the debug registers that are not switched by the VMCS.
+/// captures the debug registers that are not switched by the vmcs.
 ///
 /// # Safety
 ///
-/// The caller runs at CPL0 on the processor whose state it owns.
+/// the caller runs at cpl0 on the processor whose state it owns.
 pub unsafe fn read_debug_state() -> crate::lifecycle::DebugState {
     let (dr0, dr1, dr2, dr3, dr6): (u64, u64, u64, u64, u64);
-    // SAFETY: the caller owns this processor's privileged register state.
+    // safety: the caller owns this processor's privileged register state.
     unsafe {
         asm!("mov {}, dr0", out(reg) dr0, options(nostack, preserves_flags));
         asm!("mov {}, dr1", out(reg) dr1, options(nostack, preserves_flags));
@@ -354,13 +354,13 @@ pub unsafe fn read_debug_state() -> crate::lifecycle::DebugState {
     }
 }
 
-/// Restores the complete captured debug-register set.
+/// restores the complete captured debug-register set.
 ///
 /// # Safety
 ///
-/// The caller runs at CPL0 on the processor that produced `state`.
+/// the caller runs at cpl0 on the processor that produced `state`.
 pub unsafe fn write_debug_state(state: crate::lifecycle::DebugState) {
-    // SAFETY: the values came from this processor's captured state.
+    // safety: the values came from this processor's captured state.
     unsafe {
         asm!("mov dr0, {}", in(reg) state.dr0, options(nostack, preserves_flags));
         asm!("mov dr1, {}", in(reg) state.dr1, options(nostack, preserves_flags));

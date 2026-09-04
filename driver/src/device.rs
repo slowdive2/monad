@@ -111,11 +111,11 @@ pub fn acl_allows(principal: &str) -> bool {
     DEVICE_SDDL == "D:P(A;;GA;;;SY)(A;;GA;;;BA)" && matches!(principal, "SY" | "BA")
 }
 
-/// Creates Monad's buffered control device.
+/// creates monad's buffered control device.
 ///
 /// # Safety
 ///
-/// `driver` is the live object supplied to `DriverEntry`. This function runs
+/// `driver` is the live object supplied to `DriverEntry`. this function runs
 /// once at `PASSIVE_LEVEL` before any dispatch can arrive.
 pub unsafe fn create(driver: &mut DRIVER_OBJECT) -> NTSTATUS {
     let mut device_name = match WideString::from_ascii(DEVICE_NAME) {
@@ -169,11 +169,11 @@ pub unsafe fn create(driver: &mut DRIVER_OBJECT) -> NTSTATUS {
     STATUS_SUCCESS
 }
 
-/// Removes the symbolic link and device object.
+/// removes the symbolic link and device object.
 ///
 /// # Safety
 ///
-/// `driver` is live and Monad has stopped accepting dispatches.
+/// `driver` is live and monad has stopped accepting dispatches.
 pub unsafe fn destroy(driver: *mut DRIVER_OBJECT) {
     let mut dos_name = match WideString::from_ascii(DOS_NAME) {
         Ok(value) => value,

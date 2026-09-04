@@ -229,12 +229,12 @@ impl CpuSelection {
     }
 }
 
-/// Captures active Windows processors in stable dense order.
+/// captures active windows processors in stable dense order.
 ///
-/// This does no VMX work and runs before any processor enters VMXON.
+/// this does no vmx work and runs before any processor enters vmxon.
 pub fn snapshot_active_processors() -> MonadResult<CpuTopology> {
-    // SAFETY: the group value is the documented all-groups sentinel and the
-    // Routine has no pointer arguments.
+    // safety: the group value is the documented all-groups sentinel and the
+    // routine has no pointer arguments.
     let count = unsafe { KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) };
     if count == 0 {
         return Err(topology_error(
@@ -252,8 +252,8 @@ pub fn snapshot_active_processors() -> MonadResult<CpuTopology> {
     let mut ids = [CpuId::default(); MAX_LOGICAL_CPUS];
     for dense in 0..count {
         let mut native = PROCESSOR_NUMBER::default();
-        // SAFETY: `native` is writable and `dense < count` came
-        // From the immediately preceding active-processor snapshot.
+        // safety: `native` is writable and `dense < count` came
+        // from the immediately preceding active-processor snapshot.
         let status = unsafe { KeGetProcessorNumberFromIndex(dense, &mut native) };
         if status < 0 {
             return Err(topology_error(ErrorCode::TopologyChanged, u64::from(dense)));

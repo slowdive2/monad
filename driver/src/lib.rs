@@ -20,12 +20,12 @@ static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 #[cfg(not(test))]
 #[export_name = "DriverEntry"]
-/// Starts the driver and gives unload ownership to Windows.
+/// starts the driver and gives unload ownership to windows.
 ///
 /// # Safety
 ///
-/// Windows supplies a unique driver object and valid registry path under the
-/// WDM entry contract.
+/// windows supplies a unique driver object and valid registry path under the
+/// wdm entry contract.
 pub unsafe extern "system" fn driver_entry(
     driver: &mut DRIVER_OBJECT,
     _registry_path: PCUNICODE_STRING,

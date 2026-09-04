@@ -1,4 +1,4 @@
-# research-platform source gate.
+# research tool checks.
 
 $ErrorActionPreference = 'Stop'
 

@@ -1,4 +1,4 @@
-# Driver control-plane surface and unit gate.
+# driver checks.
 
 $ErrorActionPreference = 'Stop'
 

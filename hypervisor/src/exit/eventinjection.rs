@@ -67,9 +67,9 @@ fn vectoring_instruction_length(
     }
 }
 
-/// Converts a valid VM-exit IDT-vectoring event into a VM-entry event without
-/// changing its vector, type, or error code. The architecture specifies this
-/// copy for completing an event whose delivery caused a VM exit.
+/// converts a valid vm-exit idt-vectoring event into a vm-entry event without
+/// changing its vector, type, or error code. the architecture specifies this
+/// copy for completing an event whose delivery caused a vm exit.
 pub fn prepare_reinjection(
     context: &ExitContext,
     pending_entry_info: u32,
@@ -171,12 +171,12 @@ impl VmEntryEvent {
     }
 }
 
-// Write the valid interruption field last so partial setup stays inactive.
-/// Queues one checked event for the next VM entry.
+// write the valid interruption field last so partial setup stays inactive.
+/// queues a checked event for the next vm entry.
 ///
 /// # Safety
 ///
-/// The caller is in VMX root with this vCPU's VMCS current and does not resume
+/// the caller is in vmx root with this vcpu's vmcs current and does not resume
 /// until this succeeds.
 pub unsafe fn apply_event(
     vcpu: &mut Vcpu,
@@ -203,12 +203,12 @@ pub unsafe fn apply_event(
     Ok(())
 }
 
-/// Re-queues an event whose delivery was interrupted by the current VM exit.
+/// re-queues an event whose delivery was interrupted by the current vm exit.
 ///
 /// # Safety
 ///
-/// The caller is in VMX root with this vCPU's VMCS current and calls this at
-/// most once before the next VM entry.
+/// the caller is in vmx root with this vcpu's vmcs current and calls this at
+/// most once before the next vm entry.
 pub unsafe fn apply_vectoring_event(vcpu: &mut Vcpu, context: &ExitContext) -> MonadResult<()> {
     let pending = vmread(vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD)? as u32;
     let Some(update) = prepare_reinjection(context, pending)? else {

@@ -325,7 +325,7 @@ pub(super) fn decode_entry(
     }
 }
 
-// Layout checks
+// layout checks
 const _: () = {
     assert!(size_of::<EptPml4Entry>() == size_of::<u64>());
     assert!(size_of::<EptPdptEntry>() == size_of::<u64>());

@@ -1,4 +1,4 @@
-# Permanent checks for offline view construction and publication.
+# view build and publish checks.
 
 $ErrorActionPreference = 'Stop'
 

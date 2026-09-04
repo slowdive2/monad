@@ -12,4 +12,4 @@ pub mod telemetry;
 pub mod topology;
 pub mod vmm;
 
-// The driver owns the panic handler.
+// the driver owns the panic handler.

@@ -101,8 +101,8 @@ fn map_vmx_result(result: x86::vmx::Result<()>, operation: VmxOperation) -> Mona
         Ok(()) => Ok(()),
         Err(VmFail::VmFailInvalid) => Err(vmx_error(operation, VmxStatus::VmfailInvalid, None)),
         Err(VmFail::VmFailValid) => {
-            // SAFETY: VMfailValid means a current VMCS exists. A failed
-            // Diagnostic vmread leaves the subcode absent.
+            // safety: vmfailvalid means a current vmcs exists. a failed
+            // diagnostic vmread leaves the subcode absent.
             let instruction_error =
                 unsafe { x86::bits64::vmx::vmread(x86::vmx::vmcs::ro::VM_INSTRUCTION_ERROR) }
                     .ok()
@@ -133,10 +133,10 @@ fn pre_vmxon_failpoint() -> MonadResult<()> {
 }
 
 pub(crate) fn vmxon(region: u64, _permit: VmxonPermit) -> MonadResult<()> {
-    // This is the first possible VMXON. The private
-    // Permit proves the complete capability and topology gate has succeeded.
+    // this is the first vmxon. the permit means capability and topology
+    // checks already passed.
     pre_vmxon_failpoint()?;
-    // SAFETY: the caller owns the checked VMXON region and stays on its CPU.
+    // safety: the caller owns the checked vmxon region and stays on its cpu.
     map_vmx_result(
         unsafe { x86::bits64::vmx::vmxon(region) },
         VmxOperation::Vmxon,
@@ -144,12 +144,12 @@ pub(crate) fn vmxon(region: u64, _permit: VmxonPermit) -> MonadResult<()> {
 }
 
 pub(crate) fn vmxoff() -> MonadResult<()> {
-    // SAFETY: this vCPU already entered VMX.
+    // safety: this vcpu already entered vmx.
     map_vmx_result(unsafe { x86::bits64::vmx::vmxoff() }, VmxOperation::Vmxoff)
 }
 
 pub(crate) fn vmclear(region: u64) -> MonadResult<()> {
-    // SAFETY: region is this vCPU's aligned VMCS address.
+    // safety: region is this vcpu's aligned vmcs address.
     map_vmx_result(
         unsafe { x86::bits64::vmx::vmclear(region) },
         VmxOperation::Vmclear,
@@ -157,7 +157,7 @@ pub(crate) fn vmclear(region: u64) -> MonadResult<()> {
 }
 
 pub(crate) fn vmptrld(region: u64) -> MonadResult<()> {
-    // SAFETY: region is this vCPU's initialized VMCS address.
+    // safety: region is this vcpu's initialized vmcs address.
     map_vmx_result(
         unsafe { x86::bits64::vmx::vmptrld(region) },
         VmxOperation::Vmptrld,
@@ -165,7 +165,7 @@ pub(crate) fn vmptrld(region: u64) -> MonadResult<()> {
 }
 
 pub(crate) fn vmread(field: u32) -> MonadResult<u64> {
-    // SAFETY: VMX root is active and `field` is an Intel VMCS encoding.
+    // safety: vmx root is active and `field` is an intel vmcs encoding.
     match unsafe { x86::bits64::vmx::vmread(field) } {
         Ok(value) => Ok(value),
         Err(VmFail::VmFailInvalid) => Err(vmx_error(
@@ -174,8 +174,8 @@ pub(crate) fn vmread(field: u32) -> MonadResult<u64> {
             None,
         )),
         Err(VmFail::VmFailValid) => {
-            // SAFETY: VMfailValid guarantees a current VMCS; this reads its
-            // Instruction-error field.
+            // safety: vmfailvalid guarantees a current vmcs; this reads its
+            // instruction-error field.
             let instruction_error =
                 unsafe { x86::bits64::vmx::vmread(x86::vmx::vmcs::ro::VM_INSTRUCTION_ERROR) }
                     .ok()
@@ -194,7 +194,7 @@ pub(crate) fn vmwrite(field: u32, value: u64) -> MonadResult<()> {
     if field == x86::vmx::vmcs::control::EPTP_FULL {
         EPTP_WRITE_COUNT.fetch_add(1, Ordering::AcqRel);
     }
-    // SAFETY: VMX root is active and `field` is an Intel VMCS encoding.
+    // safety: vmx root is active and `field` is an intel vmcs encoding.
     map_vmx_result(
         unsafe { x86::bits64::vmx::vmwrite(field, value) },
         VmxOperation::Vmwrite,
@@ -244,9 +244,9 @@ pub(crate) fn restore_control_registers(original: OriginalControlRegisters) {
 }
 
 extern "efiapi" {
-    // Initial launch returns zero from `.launchsuccess` in VMX non-root mode.
-    // Vm-entry failure returns rflags; a successful
-    // Resume continues the guest and does not return here.
+    // initial launch returns zero from `.launchsuccess` in vmx non-root mode.
+    // vm-entry failure returns rflags; a successful
+    // resume continues the guest and does not return here.
     #[link_name = "launch_vm"]
     fn raw_launch_vm(regs: &mut GuestRegs, launched: u64) -> u64;
     #[link_name = "restore_guest"]
@@ -260,7 +260,7 @@ extern "efiapi" {
 
 unsafe fn enter_guest(regs: &mut GuestRegs, operation: VmxOperation) -> MonadResult<()> {
     let launched = operation == VmxOperation::Vmresume;
-    // SAFETY: the caller upholds the contract; assembly preserves the abi.
+    // safety: the caller supplied the right vmcs state; assembly keeps the abi.
     let rflags = unsafe { raw_launch_vm(regs, u64::from(launched)) };
     let vmwrite_failed = rflags & (1 << 63) != 0;
     let operation = if vmwrite_failed {
@@ -278,46 +278,46 @@ unsafe fn enter_guest(regs: &mut GuestRegs, operation: VmxOperation) -> MonadRes
     decode_vmx_status(operation, rflags & !(1 << 63), instruction_error)
 }
 
-/// Enters a clear VMCS with VMLAUNCH.
+/// enters a clear vmcs with vmlaunch.
 ///
 /// # Safety
 ///
-/// The caller is in VMX root with a current initialized clear VMCS and live
+/// the caller is in vmx root with a current initialized clear vmcs and live
 /// register storage.
 pub unsafe fn vmlaunch(regs: &mut GuestRegs) -> MonadResult<()> {
-    // SAFETY: the caller upholds the named operation's contract.
+    // safety: the vmcs state matches the requested entry.
     unsafe { enter_guest(regs, VmxOperation::Vmlaunch) }
 }
 
-/// Re-enters a launched VMCS with VMRESUME.
+/// re-enters a launched vmcs with vmresume.
 ///
 /// # Safety
 ///
-/// The caller is in VMX root with a current VMCS in the launched state and must
+/// the caller is in vmx root with a current vmcs in the launched state and must
 /// provide its live register storage.
 pub unsafe fn vmresume(regs: &mut GuestRegs) -> MonadResult<()> {
-    // SAFETY: the caller upholds the named operation's contract.
+    // safety: the vmcs state matches the requested entry.
     unsafe { enter_guest(regs, VmxOperation::Vmresume) }
 }
 
-/// Restores captured guest registers after VMXOFF.
+/// restores captured guest registers after vmxoff.
 ///
 /// # Safety
 ///
-/// `regs` holds a canonical RIP/RSP pair from this guest. VMX has ended here.
+/// `regs` holds a canonical rip/rsp pair from this guest. vmx has ended here.
 pub unsafe fn restore_guest(regs: &GuestRegs, xsave_area: *const u8, xsave_mask: u64) -> ! {
-    // SAFETY: the caller upholds the contract; control never returns.
+    // safety: vmx is off, the registers are captured, and this never returns.
     unsafe { raw_restore_guest(regs, xsave_area, xsave_mask) }
 }
 
-/// Issues the private VMCALL from its rendezvous callback.
+/// issues the private vmcall from its rendezvous callback.
 ///
 /// # Safety
 ///
-/// The caller runs at `IPI_LEVEL` in this vCPU's callback after publishing its
+/// the caller runs at `IPI_LEVEL` in this vcpu's callback after publishing its
 /// prepared mailbox.
 pub unsafe fn rendezvous_vmcall() {
-    // SAFETY: the caller establishes the accepted mailbox transition.
+    // safety: the caller establishes the accepted mailbox transition.
     unsafe { raw_rendezvous_vmcall() };
 }
 
@@ -471,8 +471,8 @@ launch_vm:
     jmp     .VmEntryFailure
 
 .Launch:
-    // Return from this FFI call in VMX non-root after VMLAUNCH. This avoids a
-    // Returns-twice rust call site.
+    // return from this ffi call in vmx non-root after vmlaunch. this avoids a
+    // returns-twice rust call site.
     mov     r14, {vmcs_guest_rsp}
     vmwrite r14, rsp
     jbe     .VmwriteFailure
@@ -488,7 +488,7 @@ launch_vm:
     jmp     .VmEntryFailure
 
 .VmwriteFailure:
-    // Tag VMWRITE failure without touching CF/ZF before capture. Rust clears it.
+    // tag vmwrite failure without touching cf/zf before capture. rust clears it.
     pushfq
     pop     rax
     bts     rax, 63
@@ -496,8 +496,8 @@ launch_vm:
     jmp     .Exit
 
 .VmEntryFailure:
-    // restore_xmm changes RSP and CF/ZF. Put RFLAGS in pushaq's saved RAX slot
-    // So popaq returns the original vm status to rust.
+    // restore_xmm changes rsp and cf/zf. put rflags in pushaq's saved rax slot
+    // so popaq returns the original vm status to rust.
     pushfq
     pop     rax
     mov     [rsp + {launch_saved_rax}], rax
@@ -510,7 +510,7 @@ launch_vm:
 
     POPAQ
 
-    // Zero means initial launch success. VM-entry failure returns RFLAGS.
+    // zero means initial launch success. vm-entry failure returns rflags.
     xor     eax, eax
     ret
 
@@ -649,7 +649,7 @@ restore_guest:
     vcpu_xsave_mask = const mem::offset_of!(Vcpu, xsave_mask),
     vmcs_guest_rsp = const x86::vmx::vmcs::guest::RSP,
     vmcs_guest_rip = const x86::vmx::vmcs::guest::RIP,
-    // Skip the pointer, xmm area, and fourteen pushaq slots before saved rax.
+    // skip the pointer, xmm area, and fourteen pushaq slots before saved rax.
     launch_saved_rax = const 8 + 0x100 + 14 * mem::size_of::<u64>(),
 );
 
