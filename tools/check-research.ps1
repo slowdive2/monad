@@ -27,7 +27,7 @@ try {
         'research/src/lib.rs',
         'monadctl/src/main.rs',
         'schemas/experiment-pack-v1.schema.json',
-        'experiments/permission-ab.example.json'
+        'examples/permission-ab.example.json'
     )) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "research-platform artifact is missing: $path"
@@ -83,7 +83,7 @@ try {
         'monadctl',
         '--',
         'validate',
-        'experiments/permission-ab.example.json'
+        'examples/permission-ab.example.json'
     )
     Write-Output 'research-platform source gate: pass'
 }

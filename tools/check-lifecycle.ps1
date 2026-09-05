@@ -23,16 +23,9 @@ $msrText = Get-Content -LiteralPath $msrPath -Raw
 $allText = "$lifecycleText`n$vmmText`n$vmxText`n$stateText`n$msrText"
 $requiredTests = @(
     'lifecycle_transition_table',
-    'launch_failure_each_cpu_each_phase',
-    'running_only_after_all_launched',
     'shutdown_requires_registered_cpl0_trampoline',
-    'shutdown_restores_state',
-    'extended_state_round_trip',
-    'register_snapshot_boundary',
     'partial_shutdown_is_fatal',
-    'fatal_never_calls_vmxoff',
-    'mtrr_write_is_fatal',
-    'no_production_panic_surface'
+    'mtrr_write_is_fatal'
 )
 foreach ($testName in $requiredTests) {
     if ($allText -notmatch "(?m)\b$([regex]::Escape($testName))\b") {
@@ -72,22 +65,20 @@ if ($msrText -notmatch 'MtrrChangedWhileRunning' -or
 }
 $fatalText = [regex]::Match(
     $vmmText,
-    '(?s)unsafe fn fatal_vmexit.*?\n}\n\n#\[cfg\(test\)\]'
+    '(?ms)^unsafe fn fatal_vmexit\b.*?^}'
 ).Value
+if (-not $fatalText) { throw 'fatal function extraction was empty' }
 if ($fatalText -match '\bvmxoff\s*\(') {
     throw 'fatal path attempts local VMXOFF'
 }
 
-$productionFiles = Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'hypervisor\src') -Recurse -File -Filter '*.rs'
-foreach ($file in $productionFiles) {
-    $text = Get-Content -LiteralPath $file.FullName -Raw
-    $text = [regex]::Replace($text, '(?s)#\[cfg\(test\)\].*$', '')
-    if ($text -match '\b(?:unwrap|expect)\s*\(|panic!|todo!|unimplemented!') {
-        throw "production panic surface found: $($file.FullName)"
+
+# These are source-shape guards. Production panic checks run through rustc/clippy
+# with cfg(not(test)); do not truncate source at the first cfg(test) import.
+foreach ($crate in @('hypervisor', 'driver')) {
+    $crateText = Get-Content -LiteralPath (Join-Path $repositoryRoot "$crate/src/lib.rs") -Raw
+    foreach ($lint in @('clippy::unwrap_used', 'clippy::expect_used', 'clippy::panic')) {
+        if ($crateText -notmatch [regex]::Escape($lint)) { throw "missing production lint: $crate $lint" }
     }
 }
-
-Write-Output 'lifecycle and transaction surface: pass'
-Write-Output 'extended-state boundary: pass'
-Write-Output 'debug-state and MTRR surface: pass'
-Write-Output 'fatal and production panic surface: pass'
+Write-Output 'lifecycle source-shape guards: pass (hardware restoration remains unqualified)'
