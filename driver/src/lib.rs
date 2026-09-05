@@ -10,17 +10,18 @@ extern crate alloc;
 extern crate wdk_panic;
 
 #[cfg(not(test))]
-use wdk_alloc::WdkAllocator;
+use allocator::KernelAllocator;
 #[cfg(not(test))]
 use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PCUNICODE_STRING, STATUS_SUCCESS};
 
+mod allocator;
 pub mod device;
 pub mod ioctl;
 pub mod session;
 
 #[cfg(not(test))]
 #[global_allocator]
-static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
+static GLOBAL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
 #[cfg(not(test))]
 #[export_name = "DriverEntry"]

@@ -276,7 +276,6 @@ version = "0.1.0"
 dependencies = [
  "hypervisor",
  "log",
- "wdk-alloc",
  "wdk-build",
  "wdk-panic",
  "wdk-sys",
@@ -837,18 +836,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "wdk-alloc"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5dd1c139c6b9c05475bc7e8b356d4fbc252954d685691d70cfaec8b42c41b72d"
-dependencies = [
- "tracing",
- "tracing-subscriber",
- "wdk-build",
- "wdk-sys",
-]
 
 [[package]]
 name = "wdk-build"

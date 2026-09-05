@@ -158,6 +158,10 @@ pub struct Vcpu {
     active: AtomicBool,
 }
 
+// Page-sized pool allocations satisfy page alignment; the entire VCPU must fit.
+const _: () = assert!(size_of::<Vcpu>() <= PAGE_SIZE);
+const _: () = assert!(core::mem::align_of::<Vcpu>() <= PAGE_SIZE);
+
 impl Vcpu {
     pub(crate) fn stamp_event(&self, event: EventRecord) -> EventRecord {
         event.with_provenance(self.run_id, self.rendezvous_epoch.load(Ordering::Acquire))
@@ -471,7 +475,7 @@ unsafe fn init_vcpu(
     run_id: u64,
 ) -> *mut Vcpu {
     let vcpu: *mut Vcpu =
-        unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, size_of::<Vcpu>() as u64, VMM_TAG).cast() };
+        unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE as u64, VMM_TAG).cast() };
     if vcpu.is_null() {
         log::error!(
             "vmm.rs: ExAllocatePool2 failed: size={} tag={:#x}",
