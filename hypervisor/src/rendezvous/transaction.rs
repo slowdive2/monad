@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_failure_is_fatal() {
+    fn illustrative_rollback_failure_model() {
         let transaction = RendezvousTransaction::new(1, 2, &[0, 1], 100).expect("tx");
         let mut active = view(1, 0x2000);
         let mut backend = ModelBackend {
