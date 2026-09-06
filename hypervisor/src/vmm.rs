@@ -135,6 +135,7 @@ pub struct Vcpu {
     pub(crate) root_xcr0: u64,
     pub(crate) guest_xcr0: u64,
     pub(crate) root_cr3: u64,
+    pub(crate) mtrr_count: u8,
     pub(crate) regs: GuestRegs,
 
     pub(crate) active_view: ActiveViewState,
@@ -350,7 +351,7 @@ unsafe fn init_msr_bitmap(vcpu: *mut Vcpu) -> bool {
     unsafe {
         core::ptr::write_bytes(msr_bitmap, 0, PAGE_SIZE);
         for msr in 0u32..=0x1fff {
-            if crate::exit::msr::is_mtrr_write(msr) {
+            if crate::exit::msr::is_mtrr_write(msr, (*vcpu).mtrr_count) {
                 let index = msr as usize;
                 let byte = 2048 + index / 8;
                 *msr_bitmap.add(byte) |= 1u8 << (index & 7);
@@ -474,6 +475,7 @@ unsafe fn init_vcpu(
     platform: &ValidatedPlatform,
     cpu: CpuId,
     run_id: u64,
+    mtrr_count: u8,
 ) -> *mut Vcpu {
     let vcpu: *mut Vcpu =
         unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE as u64, VMM_TAG).cast() };
@@ -487,6 +489,7 @@ unsafe fn init_vcpu(
     };
 
     unsafe {
+        (*vcpu).mtrr_count = mtrr_count;
         (*vcpu).launch_error = None;
         (*vcpu).capabilities = platform.capabilities;
         (*vcpu).vmxon_permit = platform.vmxon_permit();
@@ -1381,6 +1384,8 @@ unsafe fn activate_base(ctx: *mut Vmm) -> MonadResult<()> {
 
 struct LaunchContext {
     vmm: *mut Vmm,
+    mtrrs: *const crate::ept::RawMtrrState,
+    verified: AtomicU32,
     epoch: u64,
     participant_count: u32,
     arrived: AtomicU32,
@@ -1408,6 +1413,29 @@ unsafe extern "C" fn launch_cpu(context: u64) -> u64 {
     }
     let launch = unsafe { &*launch };
     let vcpu = unsafe { current_vcpu(launch.vmm) };
+    if vcpu.is_null()
+        || !unsafe { &*launch.mtrrs }.matches_registers(crate::arch::intel::state::read_msr)
+    {
+        launch.failed.store(true, Ordering::Release);
+        if !vcpu.is_null() {
+            unsafe {
+                (*vcpu).launch_error = Some(
+                    MonadError::new(ErrorPhase::Mtrr, ErrorCode::UnsupportedMtrrCombination, 0)
+                        .on_cpu((*vcpu).cpu.dense_index),
+                );
+            }
+        }
+    }
+    launch.verified.fetch_add(1, Ordering::AcqRel);
+    if !wait_launch_barrier(&launch.verified, launch) {
+        #[cfg(not(test))]
+        fatal_rendezvous(u16::MAX, 6);
+        #[cfg(test)]
+        return 0;
+    }
+    if launch.failed.load(Ordering::Acquire) {
+        return 0; // all CPUs made the same pre-VMX decision
+    }
     if vcpu.is_null() {
         launch.failed.store(true, Ordering::Release);
     } else {
@@ -1661,7 +1689,15 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
                 u64::from(i),
             ));
         };
-        let vcpu = unsafe { init_vcpu(base_eptp, &platform, cpu, config.session_nonce) };
+        let vcpu = unsafe {
+            init_vcpu(
+                base_eptp,
+                &platform,
+                cpu,
+                config.session_nonce,
+                raw_mtrrs.variable.len() as u8,
+            )
+        };
         alloc_failed |= vcpu.is_null();
         if vcpu.is_null() {
             log::error!("vcpu alloc failed for processor {}", i);
@@ -1722,6 +1758,8 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         .transition(LifecycleState::Preparing, LifecycleState::Launching)?;
     let mut launch = LaunchContext {
         vmm: ctx,
+        mtrrs: &raw_mtrrs,
+        verified: AtomicU32::new(0),
         epoch,
         participant_count: cpu_count,
         arrived: AtomicU32::new(0),

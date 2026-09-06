@@ -305,8 +305,8 @@ mod tests {
     #[test]
     fn mtrr_write_is_fatal() {
         for msr in [0x200u32, 0x20f, 0x250, 0x258, 0x259, 0x268, 0x26f, 0x2ff] {
-            assert!(crate::exit::msr::is_mtrr_write(msr));
+            assert!(crate::exit::msr::is_mtrr_write(msr, 8));
         }
-        assert!(!crate::exit::msr::is_mtrr_write(0x1b));
+        assert!(!crate::exit::msr::is_mtrr_write(0x1b, 8));
     }
 }
