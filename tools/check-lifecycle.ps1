@@ -60,9 +60,9 @@ foreach ($register in @('dr0', 'dr1', 'dr2', 'dr3', 'dr6', 'dr7')) {
     }
 }
 if ($msrText -notmatch 'MtrrChangedWhileRunning' -or
-    $msrText -notmatch '(?s)0x200\.\.=0x20f.*0x250.*0x258.*0x259.*0x268\.\.=0x26f.*0x2ff' -or
+    $msrText -notmatch 'variable_count as u32' -or
     $vmmText -notmatch 'write_bytes\(msr_bitmap, 0, PAGE_SIZE\)' -or
-    $vmmText -notmatch 'is_mtrr_write\(msr\)') {
+    $vmmText -notmatch 'is_mtrr_write\(msr,') {
     throw 'MTRR-write interception is missing'
 }
 $fatalText = [regex]::Match(

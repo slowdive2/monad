@@ -16,6 +16,7 @@ const MTRR_ENABLE: u64 = 1 << 11;
 const FIXED_ENABLE: u64 = 1 << 10;
 const FIXED_SUPPORTED: u64 = 1 << 8;
 const VARIABLE_VALID: u64 = 1 << 11;
+pub const MAX_VARIABLE_MTRRS: u8 = 40;
 const FIXED_REGISTER_COUNT: usize = 11;
 
 #[repr(u64)]
@@ -63,6 +64,10 @@ pub struct RawMtrrState {
 pub fn collect_raw_mtrr_state(max_physical_bits: u8) -> MonadResult<RawMtrrState> {
     let capability = read_msr(IA32_MTRRCAP);
     let variable_count = (capability & 0xff) as usize;
+    // Variable MSRs must not overlap the fixed-register range at 0x250.
+    if variable_count > usize::from(MAX_VARIABLE_MTRRS) || capability & FIXED_SUPPORTED == 0 {
+        return Err(mtrr_error(MtrrErrorDetail::InvalidVariableCount));
+    }
     let mut variable = Vec::new();
     variable.try_reserve_exact(variable_count).map_err(|_| {
         MonadError::new(
@@ -91,6 +96,26 @@ pub fn collect_raw_mtrr_state(max_physical_bits: u8) -> MonadResult<RawMtrrState
         variable: variable.into_boxed_slice(),
         max_physical_bits,
     })
+}
+
+impl RawMtrrState {
+    /// Allocation-free revalidation; called by every CPU before any CPU enters VMX.
+    pub fn matches_registers(&self, mut read: impl FnMut(u32) -> u64) -> bool {
+        if read(IA32_MTRRCAP) != self.capability || read(IA32_MTRR_DEF_TYPE) != self.default_type {
+            return false;
+        }
+        let fixed_msrs = [
+            0x250, 0x258, 0x259, 0x268, 0x269, 0x26a, 0x26b, 0x26c, 0x26d, 0x26e, 0x26f,
+        ];
+        fixed_msrs
+            .iter()
+            .zip(self.fixed)
+            .all(|(&msr, value)| read(msr) == value)
+            && self.variable.iter().enumerate().all(|(index, value)| {
+                read(IA32_MTRR_PHYSBASE0 + index as u32 * 2) == value.base
+                    && read(IA32_MTRR_PHYSMASK0 + index as u32 * 2) == value.mask
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,5 +543,34 @@ mod tests {
             memory_type: EptMemoryType::WriteBack,
         };
         assert!(NormalizedMemoryMap::from_intervals(&[first, same], PAGE_SIZE_4K * 2).is_err());
+    }
+    #[test]
+    fn launch_snapshot_and_interception_cover_every_admitted_register() {
+        for count in [0u8, 4, 8, 10, MAX_VARIABLE_MTRRS] {
+            let state = RawMtrrState {
+                capability: FIXED_SUPPORTED | u64::from(count),
+                default_type: 0xc06,
+                fixed: [0; FIXED_REGISTER_COUNT],
+                variable: alloc::vec![RawVariableMtrr { base: 0, mask: 0 }; usize::from(count)]
+                    .into_boxed_slice(),
+                max_physical_bits: 48,
+            };
+            let read = |msr| match msr {
+                IA32_MTRRCAP => state.capability,
+                IA32_MTRR_DEF_TYPE => state.default_type,
+                _ => 0,
+            };
+            assert!(state.matches_registers(read));
+            for msr in (0x200..0x200 + u32::from(count) * 2).chain([
+                0x250, 0x258, 0x259, 0x268, 0x269, 0x26a, 0x26b, 0x26c, 0x26d, 0x26e, 0x26f, 0x2ff,
+            ]) {
+                assert!(crate::exit::msr::is_mtrr_write(msr, count));
+                assert!(!state.matches_registers(|field| read(field) ^ u64::from(field == msr)));
+            }
+            assert!(
+                !crate::exit::msr::is_mtrr_write(0x200 + u32::from(count) * 2, count)
+                    || count == MAX_VARIABLE_MTRRS
+            );
+        }
     }
 }
