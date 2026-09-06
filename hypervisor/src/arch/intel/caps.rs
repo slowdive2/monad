@@ -35,6 +35,39 @@ pub fn cpuid(leaf: u32, subleaf: u32) -> CpuidRegisters {
     }
 }
 
+/// Query XCR0-dependent sizes with the guest mask. No compiled code runs while
+/// the temporary mask is installed, and RBX's ABI value is preserved.
+///
+/// # Safety
+/// CPL0, OSXSAVE enabled, and both masks passed the platform/XSETBV checks.
+pub(crate) unsafe fn guest_xsave_cpuid(
+    subleaf: u32,
+    guest_xcr0: u64,
+    root_xcr0: u64,
+) -> CpuidRegisters {
+    let (eax, ebx, ecx, edx): (u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "xor ecx, ecx", "mov rax, r8", "mov rdx, rax", "shr rdx, 32", "xsetbv",
+            "mov eax, 0x0d", "mov ecx, r11d", "cpuid",
+            "mov r10d, eax", "mov r11d, ebx", "mov esi, ecx", "mov edi, edx",
+            "xor ecx, ecx", "mov rax, r9", "mov rdx, rax", "shr rdx, 32", "xsetbv",
+            "pop rbx",
+            in("r8") guest_xcr0, in("r9") root_xcr0,
+            lateout("r10") eax, inlateout("r11") u64::from(subleaf) => ebx,
+            lateout("rsi") ecx, lateout("rdi") edx,
+            out("rax") _, out("rcx") _, out("rdx") _,
+        );
+    }
+    CpuidRegisters {
+        eax: eax as u32,
+        ebx: ebx as u32,
+        ecx: ecx as u32,
+        edx: edx as u32,
+    }
+}
+
 pub fn current_initial_apic_id() -> u32 {
     cpuid(1, 0).ebx >> 24
 }
@@ -463,6 +496,12 @@ pub fn validate_required_capabilities(raw: &RawCapabilities) -> MonadResult<Inte
         }
     }
 
+    if raw.xcr0_supported & !crate::exit::xsetbv::KNOWN_XCR0 != 0
+        || raw.xcr0_supported & 3 != 3
+        || !crate::exit::xsetbv::valid_xcr0(raw.xcr0_supported, raw.xcr0_supported)
+    {
+        return Err(unsupported(RequiredCapability::XsaveLayout));
+    }
     let control_capabilities = ControlCapabilities {
         pinbased: ControlCapability::from_msr(raw.pinbased_controls),
         primary: ControlCapability::from_msr(raw.primary_controls),

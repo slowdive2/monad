@@ -25,7 +25,9 @@ $requiredTests = @(
     'lifecycle_transition_table',
     'shutdown_requires_registered_cpl0_trampoline',
     'partial_shutdown_is_fatal',
-    'mtrr_write_is_fatal'
+    'mtrr_write_is_fatal',
+    'native_return_reads_current_descriptor_and_base_state',
+    'native_control_admission_rejects_lossy_or_unimplemented_state'
 )
 foreach ($testName in $requiredTests) {
     if ($allText -notmatch "(?m)\b$([regex]::Escape($testName))\b") {
@@ -84,4 +86,12 @@ foreach ($crate in @('hypervisor', 'driver')) {
 $initText = [regex]::Match($vmmText, '(?ms)^unsafe fn init_cpu\b.*?^}').Value
 if (-not $initText) { throw 'init_cpu extraction was empty' }
 if ($initText -match 'log::|DbgPrint') { throw 'IPI launch callback contains formatted logging' }
+if ($exitAssembly -notmatch '(?s)sub\s+r15,\s*\{vcpu_regs\}.*?\{vcpu_xsave_area\}.*?xsaves64') {
+    throw 'VM-exit save does not restore the VCPU base before whole-object offsets'
+}
+$nativeText = [regex]::Match($vmxText, '(?s)restore_guest:.*?ret\s*').Value
+if (-not $nativeText -or $nativeText -match 'movaps|call\s' -or
+    $nativeText -notmatch '(?s)xrstors64.*?xsetbv.*?mov\s+cr0') {
+    throw 'native restoration source ordering is missing'
+}
 Write-Output 'lifecycle source-shape guards: pass (hardware restoration remains unqualified)'
