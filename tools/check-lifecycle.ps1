@@ -81,4 +81,7 @@ foreach ($crate in @('hypervisor', 'driver')) {
         if ($crateText -notmatch [regex]::Escape($lint)) { throw "missing production lint: $crate $lint" }
     }
 }
+$initText = [regex]::Match($vmmText, '(?ms)^unsafe fn init_cpu\b.*?^}').Value
+if (-not $initText) { throw 'init_cpu extraction was empty' }
+if ($initText -match 'log::|DbgPrint') { throw 'IPI launch callback contains formatted logging' }
 Write-Output 'lifecycle source-shape guards: pass (hardware restoration remains unqualified)'
