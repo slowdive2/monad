@@ -1041,6 +1041,14 @@ fn fatal_rendezvous(cpu: u16, detail: u64) -> ! {
     }
 }
 
+fn switch_completed(
+    active: ActiveViewState,
+    target: ActiveViewState,
+    mailbox: Option<crate::rendezvous::MailboxState>,
+) -> bool {
+    active == target && mailbox == Some(crate::rendezvous::MailboxState::Completed)
+}
+
 unsafe extern "C" fn activate_cpu(context: u64) -> u64 {
     let activation = context as *const ActivationContext;
     if activation.is_null() {
@@ -1065,7 +1073,10 @@ unsafe extern "C" fn activate_cpu(context: u64) -> u64 {
     if transaction.is_target(dense) {
         // safety: passive control prepared this vcpu's mailbox.
         unsafe { rendezvous_vmcall() };
-        let switched = unsafe { (*vcpu).active_view == activation.target };
+        let switched =
+            switch_completed(unsafe { (*vcpu).active_view }, activation.target, unsafe {
+                (*vcpu).mailbox.state()
+            });
         let status = unsafe { (*vcpu).mailbox.status() };
         if switched {
             transaction.set_result(dense, CpuResultState::Switched, status);
@@ -1087,7 +1098,7 @@ unsafe extern "C" fn activate_cpu(context: u64) -> u64 {
 
     if transaction.failed.load(Ordering::Acquire)
         && transaction.is_target(dense)
-        && unsafe { (*vcpu).active_view == activation.target }
+        && transaction.per_cpu[usize::from(dense)].state() == CpuResultState::Switched as u32
     {
         let old = activation.old[usize::from(dense)];
         if unsafe { (*vcpu).mailbox.reset() }.is_err()
@@ -2007,5 +2018,32 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
             MonadError::new(ErrorPhase::Launch, ErrorCode::LaunchRollbackFailure, 0)
                 .on_cpu(cpu_index),
         )
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    #[test]
+    fn failed_noop_switch_is_not_reported_as_committed() {
+        let view = ActiveViewState {
+            id: ViewId {
+                slot: 0,
+                reserved: 0,
+                generation: 8,
+            },
+            eptp: 0x101e,
+        };
+        for state in [
+            crate::rendezvous::MailboxState::Failed,
+            crate::rendezvous::MailboxState::Executing,
+        ] {
+            assert!(!switch_completed(view, view, Some(state)));
+        }
+        assert!(switch_completed(
+            view,
+            view,
+            Some(crate::rendezvous::MailboxState::Completed)
+        ));
     }
 }
