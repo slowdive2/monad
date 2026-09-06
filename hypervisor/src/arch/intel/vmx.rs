@@ -233,9 +233,35 @@ pub(crate) fn prepare_control_registers(
             super::caps::RequiredCapability::Cr4FixedMasks as u64,
         ));
     }
+    validate_native_controls(original, adjusted_cr0, adjusted_cr4)?;
     write_cr0(adjusted_cr0);
     write_cr4(adjusted_cr4);
     Ok(original)
+}
+
+// Four-level Windows profile; unsupported active state is rejected losslessly.
+pub(crate) const UNSUPPORTED_CR4: u64 = !((1u64 << 23) - 1) | (1 << 12) | (1 << 19);
+pub(crate) const FROZEN_CR4: u64 =
+    UNSUPPORTED_CR4 | (1 << 5) | (1 << 9) | (1 << 13) | (1 << 17) | (1 << 18);
+
+fn validate_native_controls(
+    original: OriginalControlRegisters,
+    adjusted_cr0: u64,
+    adjusted_cr4: u64,
+) -> MonadResult<()> {
+    if original.cr0 & ((1 << 2) | (1 << 3)) != 0
+        || original.cr4 & (UNSUPPORTED_CR4 | (1 << 13)) != 0
+        || original.cr4 & ((1 << 5) | (1 << 9) | (1 << 18)) != ((1 << 5) | (1 << 9) | (1 << 18))
+        || original.cr0 != adjusted_cr0
+        || adjusted_cr4 != original.cr4 | (1 << 13)
+    {
+        return Err(MonadError::new(
+            ErrorPhase::Capability,
+            ErrorCode::UnsupportedCapability,
+            original.cr4,
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn restore_control_registers(original: OriginalControlRegisters) {
@@ -250,7 +276,13 @@ extern "efiapi" {
     #[link_name = "launch_vm"]
     fn raw_launch_vm(regs: &mut GuestRegs, launched: u64) -> u64;
     #[link_name = "restore_guest"]
-    fn raw_restore_guest(regs: &GuestRegs, xsave_area: *const u8, xsave_mask: u64) -> !;
+    fn raw_restore_guest(
+        regs: &GuestRegs,
+        xsave_area: *const u8,
+        xsave_mask: u64,
+        guest_xcr0: u64,
+        guest_cr0: u64,
+    ) -> !;
     #[link_name = "rendezvous_vmcall"]
     fn raw_rendezvous_vmcall();
     static rendezvous_vmcall_start: u8;
@@ -305,9 +337,15 @@ pub unsafe fn vmresume(regs: &mut GuestRegs) -> MonadResult<()> {
 /// # Safety
 ///
 /// `regs` holds a canonical rip/rsp pair from this guest. vmx has ended here.
-pub unsafe fn restore_guest(regs: &GuestRegs, xsave_area: *const u8, xsave_mask: u64) -> ! {
+pub unsafe fn restore_guest(
+    regs: &GuestRegs,
+    xsave_area: *const u8,
+    xsave_mask: u64,
+    guest_xcr0: u64,
+    guest_cr0: u64,
+) -> ! {
     // safety: vmx is off, the registers are captured, and this never returns.
-    unsafe { raw_restore_guest(regs, xsave_area, xsave_mask) }
+    unsafe { raw_restore_guest(regs, xsave_area, xsave_mask, guest_xcr0, guest_cr0) }
 }
 
 /// issues the private vmcall from its rendezvous callback.
@@ -402,7 +440,7 @@ rendezvous_vmcall_end:
 
 
 .macro RESTORE_XMM
-movaps xmm0, xmmword ptr [rsp]
+    movaps xmm0, xmmword ptr [rsp]
     movaps xmm1, xmmword ptr [rsp + 0x10]
     movaps xmm2, xmmword ptr [rsp + 0x20]
     movaps xmm3, xmmword ptr [rsp + 0x30]
@@ -437,6 +475,15 @@ launch_vm:
     mov     r12, [r13 + {vcpu_xsave_area}]
     test    r14, r14
     jne     .RestoreExtended
+    xor     ecx, ecx
+    xgetbv
+    shl     rdx, 32
+    or      rax, rdx
+    mov     [r13 + {vcpu_guest_xcr0}], rax
+    mov     rax, [r13 + {vcpu_root_xcr0}]
+    mov     rdx, rax
+    shr     rdx, 32
+    xsetbv
     mov     rax, [r13 + {vcpu_xsave_mask}]
     mov     rdx, rax
     shr     rdx, 32
@@ -447,6 +494,11 @@ launch_vm:
     mov     rdx, rax
     shr     rdx, 32
     xrstors64 [r12]
+    xor     ecx, ecx
+    mov     rax, [r13 + {vcpu_guest_xcr0}]
+    mov     rdx, rax
+    shr     rdx, 32
+    xsetbv
 
     mov     rax, [r15 + {registers_rax}]
     mov     rbx, [r15 + {registers_rbx}]
@@ -515,6 +567,13 @@ launch_vm:
     ret
 
 .Exit:
+    mov     r13, [rsp]
+    sub     r13, {vcpu_regs}
+    xor     ecx, ecx
+    mov     rax, [r13 + {vcpu_root_xcr0}]
+    mov     rdx, rax
+    shr     rdx, 32
+    xsetbv
     pop     rax
 
     RESTORE_XMM
@@ -542,16 +601,25 @@ vmexit_entry:
     mov     [r15 + {registers_r13}], r13
     mov     [r15 + {registers_r14}], r14
 
+    mov     rax, [rsp]
+    mov     [r15 + {registers_r15}], rax
+
+    sub     r15, {vcpu_regs}
+    xor     ecx, ecx
+    xgetbv
+    shl     rdx, 32
+    or      rax, rdx
+    mov     [r15 + {vcpu_guest_xcr0}], rax
+    mov     rax, [r15 + {vcpu_root_xcr0}]
+    mov     rdx, rax
+    shr     rdx, 32
+    xsetbv
     mov     r14, [r15 + {vcpu_xsave_area}]
     mov     rax, [r15 + {vcpu_xsave_mask}]
     mov     rdx, rax
     shr     rdx, 32
     xsaves64 [r14]
 
-    mov     rax, [rsp]
-    mov     [r15 + {registers_r15}], rax
-
-    sub     r15, {vcpu_regs}
     mov     rcx, r15
     sub     rsp, 0x20
     call    vmexit_handler
@@ -560,12 +628,20 @@ vmexit_entry:
 .global restore_guest
 restore_guest:
     mov     r15, rcx
+    mov     r13, r9
+    mov     r12, [rsp + 0x28]
 
     mov     r14, rdx
     mov     rax, r8
     mov     rdx, rax
     shr     rdx, 32
     xrstors64 [r14]
+    xor     ecx, ecx
+    mov     rax, r13
+    mov     rdx, rax
+    shr     rdx, 32
+    xsetbv
+    mov     cr0, r12
 
     mov     rax, [r15 + {registers_rsp}]
     mov     rcx, [r15 + {registers_rip}]
@@ -574,22 +650,6 @@ restore_guest:
     push    rcx
     push    rdx
 
-    movaps  xmm0, [r15 + {registers_xmm0}]
-    movaps  xmm1, [r15 + {registers_xmm1}]
-    movaps  xmm2, [r15 + {registers_xmm2}]
-    movaps  xmm3, [r15 + {registers_xmm3}]
-    movaps  xmm4, [r15 + {registers_xmm4}]
-    movaps  xmm5, [r15 + {registers_xmm5}]
-    movaps  xmm6, [r15 + {registers_xmm6}]
-    movaps  xmm7, [r15 + {registers_xmm7}]
-    movaps  xmm8, [r15 + {registers_xmm8}]
-    movaps  xmm9, [r15 + {registers_xmm9}]
-    movaps  xmm10, [r15 + {registers_xmm10}]
-    movaps  xmm11, [r15 + {registers_xmm11}]
-    movaps  xmm12, [r15 + {registers_xmm12}]
-    movaps  xmm13, [r15 + {registers_xmm13}]
-    movaps  xmm14, [r15 + {registers_xmm14}]
-    movaps  xmm15, [r15 + {registers_xmm15}]
 
     mov     rbx, [r15 + {registers_rbx}]
     mov     rdx, [r15 + {registers_rdx}]
@@ -628,25 +688,11 @@ restore_guest:
     registers_rsp = const mem::offset_of!(GuestRegs, rsp),
     registers_rip = const mem::offset_of!(GuestRegs, rip),
     registers_rflags = const mem::offset_of!(GuestRegs, rflags),
-    registers_xmm0 = const mem::offset_of!(GuestRegs, xmm0),
-    registers_xmm1 = const mem::offset_of!(GuestRegs, xmm1),
-    registers_xmm2 = const mem::offset_of!(GuestRegs, xmm2),
-    registers_xmm3 = const mem::offset_of!(GuestRegs, xmm3),
-    registers_xmm4 = const mem::offset_of!(GuestRegs, xmm4),
-    registers_xmm5 = const mem::offset_of!(GuestRegs, xmm5),
-    registers_xmm6 = const mem::offset_of!(GuestRegs, xmm6),
-    registers_xmm7 = const mem::offset_of!(GuestRegs, xmm7),
-    registers_xmm8 = const mem::offset_of!(GuestRegs, xmm8),
-    registers_xmm9 = const mem::offset_of!(GuestRegs, xmm9),
-    registers_xmm10 = const mem::offset_of!(GuestRegs, xmm10),
-    registers_xmm11 = const mem::offset_of!(GuestRegs, xmm11),
-    registers_xmm12 = const mem::offset_of!(GuestRegs, xmm12),
-    registers_xmm13 = const mem::offset_of!(GuestRegs, xmm13),
-    registers_xmm14 = const mem::offset_of!(GuestRegs, xmm14),
-    registers_xmm15 = const mem::offset_of!(GuestRegs, xmm15),
     vcpu_regs = const mem::offset_of!(Vcpu, regs),
     vcpu_xsave_area = const mem::offset_of!(Vcpu, xsave_area),
     vcpu_xsave_mask = const mem::offset_of!(Vcpu, xsave_mask),
+    vcpu_guest_xcr0 = const mem::offset_of!(Vcpu, guest_xcr0),
+    vcpu_root_xcr0 = const mem::offset_of!(Vcpu, root_xcr0),
     vmcs_guest_rsp = const x86::vmx::vmcs::guest::RSP,
     vmcs_guest_rip = const x86::vmx::vmcs::guest::RIP,
     // skip the pointer, xmm area, and fourteen pushaq slots before saved rax.
@@ -702,5 +748,31 @@ mod tests {
         let error = pre_vmxon_failpoint().expect_err("armed failpoint must stop before VMXON");
         assert_eq!(error.code, ErrorCode::VmxInstructionFailure);
         assert!(pre_vmxon_failpoint().is_ok());
+    }
+    #[test]
+    fn native_control_admission_rejects_lossy_or_unimplemented_state() {
+        let original = OriginalControlRegisters {
+            cr0: 0x80010033,
+            cr4: (1 << 5) | (1 << 9) | (1 << 18),
+        };
+        assert!(validate_native_controls(original, original.cr0, original.cr4 | (1 << 13)).is_ok());
+        for bit in [12, 19, 23, 24, 25, 63] {
+            let changed = OriginalControlRegisters {
+                cr4: original.cr4 | (1u64 << bit),
+                ..original
+            };
+            let error = validate_native_controls(changed, changed.cr0, changed.cr4 | (1 << 13))
+                .expect_err("unsupported active state");
+            assert_eq!(
+                error.detail, changed.cr4,
+                "raw state must survive diagnostics"
+            );
+        }
+        assert!(
+            validate_native_controls(original, original.cr0 ^ 1, original.cr4 | (1 << 13)).is_err()
+        );
+        assert!(
+            validate_native_controls(original, original.cr0, original.cr4 & !(1 << 18)).is_err()
+        );
     }
 }

@@ -207,6 +207,10 @@ fn setup_guest_state(guest_desc: &Descriptors, regs: &GuestRegs, vcpu: &Vcpu) ->
     vmwrite(vmcs::guest::CR3, read_cr3())?;
     vmwrite(vmcs::guest::CR4, cr4.guest)?;
     vmwrite(vmcs::guest::DR7, read_dr7())?;
+    vmwrite(vmcs::guest::IA32_DEBUGCTL_FULL, read_msr(0x1d9))?;
+    vmwrite(vmcs::guest::ACTIVITY_STATE, 0)?;
+    vmwrite(vmcs::guest::INTERRUPTIBILITY_STATE, 0)?;
+    vmwrite(vmcs::guest::PENDING_DBG_EXCEPTIONS, 0)?;
 
     vmwrite(vmcs::guest::RSP, regs.rsp)?;
     vmwrite(vmcs::guest::RIP, regs.rip)?;
@@ -349,11 +353,18 @@ unsafe fn setup_controls(vcpu: &mut Vcpu) -> MonadResult<()> {
     // eptp cache type is for the tables, not mapped ram
     vmwrite(vmcs::control::EPTP_FULL, vcpu.active_view.eptp)?;
 
-    vmwrite(vmcs::control::CR0_GUEST_HOST_MASK, cr0.mask)?;
-    vmwrite(vmcs::control::CR4_GUEST_HOST_MASK, cr4.mask)?;
+    vmwrite(
+        vmcs::control::CR0_GUEST_HOST_MASK,
+        cr0.mask | (1 << 0) | (1 << 31),
+    )?;
+    vmwrite(
+        vmcs::control::CR4_GUEST_HOST_MASK,
+        cr4.mask | super::vmx::FROZEN_CR4,
+    )?;
     vmwrite(vmcs::control::CR0_READ_SHADOW, cr0.read_shadow)?;
     vmwrite(vmcs::control::CR4_READ_SHADOW, cr4.read_shadow)?;
 
+    vmwrite(vmcs::control::XSS_EXITING_BITMAP_FULL, 0)?;
     vmwrite(vmcs::control::EXCEPTION_BITMAP, 0u64)?;
     vmwrite(vmcs::control::PAGE_FAULT_ERR_CODE_MASK, 0u64)?;
     vmwrite(vmcs::control::PAGE_FAULT_ERR_CODE_MATCH, 0u64)?;
@@ -400,6 +411,7 @@ pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) -> MonadResult<()> {
             vmexit_entry as *const () as usize as u64,
         )?;
 
-        setup_controls(vcpu)
+        setup_controls(vcpu)?;
+        super::invept::invept_all()
     }
 }

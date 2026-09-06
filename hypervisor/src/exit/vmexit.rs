@@ -31,6 +31,7 @@ mod exit_reason {
     pub const EPT_MISCONFIGURATION: u64 = 49;
     pub const INVEPT: u64 = 50;
     pub const INVVPID: u64 = 53;
+    pub const XSETBV: u64 = 55;
     pub const VMFUNC: u64 = 59;
 }
 
@@ -38,6 +39,7 @@ mod exit_reason {
 enum ExitRoute {
     TripleFault,
     Cpuid,
+    Xsetbv,
     Vmcall,
     GuestVmxInstruction,
     Rdmsr,
@@ -51,6 +53,7 @@ const fn route_exit_reason(reason: u64) -> ExitRoute {
     match reason {
         exit_reason::TRIPLE_FAULT => ExitRoute::TripleFault,
         exit_reason::CPUID => ExitRoute::Cpuid,
+        exit_reason::XSETBV => ExitRoute::Xsetbv,
         exit_reason::VMCALL => ExitRoute::Vmcall,
         exit_reason::VMCLEAR
         | exit_reason::VMLAUNCH
@@ -237,7 +240,10 @@ pub unsafe fn handle(vcpu: &mut Vcpu) -> VmExitAction {
     vcpu.regs.rflags = context.guest_rflags;
 
     let disposition = match route_exit_reason(u64::from(context.basic_reason)) {
-        ExitRoute::Cpuid => cpuid::handle(vcpu),
+        ExitRoute::Cpuid => cpuid::handle(vcpu, context.guest_cr4),
+        ExitRoute::Xsetbv => {
+            super::xsetbv::handle(vcpu, context.guest_cs_selector, context.guest_cr4)
+        }
         ExitRoute::Rdmsr => msr::handle(vcpu, false),
         ExitRoute::Wrmsr => {
             let disposition = msr::handle(vcpu, true);

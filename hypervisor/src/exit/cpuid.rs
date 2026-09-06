@@ -14,11 +14,21 @@ enum FeatureBits {
     HypervisorPresentBit = 31,
 }
 
-pub fn handle(vcpu: &mut Vcpu) -> ExitDisposition {
+pub fn handle(vcpu: &mut Vcpu, guest_cr4: u64) -> ExitDisposition {
     let leaf = vcpu.regs.rax as u32;
     let subleaf = vcpu.regs.rcx as u32;
 
-    let mut cpuid_result = cpuid(leaf, subleaf);
+    let mut cpuid_result = if leaf == 0xd && subleaf <= 1 {
+        // safety: the VMX state boundary maintains validated root/guest masks.
+        unsafe {
+            crate::arch::intel::caps::guest_xsave_cpuid(subleaf, vcpu.guest_xcr0, vcpu.root_xcr0)
+        }
+    } else {
+        cpuid(leaf, subleaf)
+    };
+    if leaf == 7 && subleaf == 0 {
+        cpuid_result.ecx.set_bit(4, guest_cr4 & (1 << 22) != 0);
+    }
 
     if leaf == CpuidLeaf::FeatureInformation as u32 {
         cpuid_result

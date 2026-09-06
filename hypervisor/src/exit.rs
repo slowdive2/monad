@@ -9,3 +9,5 @@ pub mod msr;
 pub mod triplefault;
 pub mod vmcall;
 pub mod vmexit;
+
+pub(crate) mod xsetbv;

@@ -44,7 +44,7 @@ impl ExitFieldValidity {
         let ept = reason == 48;
         Self {
             qualification: ept,
-            instruction_length: matches!(reason, 10 | 18 | 31 | 32),
+            instruction_length: matches!(reason, 10 | 18 | 31 | 32 | 55),
             guest_linear_address: ept && qualification & (1 << 7) != 0,
             guest_physical_address: matches!(reason, 48 | 49),
             exit_interruption_info: false,

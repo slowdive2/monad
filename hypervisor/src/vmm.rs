@@ -20,10 +20,7 @@ use x86::msr::{IA32_SYSENTER_CS, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP};
 
 use crate::arch::intel::{
     caps::{collect_capabilities, cpuid, IntelCapabilities, ValidatedPlatform, VmxonPermit},
-    state::{
-        read_debug_state, read_tsc, write_cr0, write_cr3, write_cr4, write_debug_state, write_msr,
-        Descriptors,
-    },
+    state::{read_tsc, write_cr3, write_cr4, write_dr7, write_msr, Descriptors, NativeReturnState},
     vmcs::{capture_registers, setup_vmcs, GuestRegs},
     vmx::{
         prepare_control_registers, rendezvous_vmcall, rendezvous_vmcall_bounds,
@@ -135,6 +132,8 @@ pub struct Vcpu {
     pub(crate) xsave_area: *mut u8,
     pub(crate) xsave_size: u32,
     pub(crate) xsave_mask: u64,
+    pub(crate) root_xcr0: u64,
+    pub(crate) guest_xcr0: u64,
     pub(crate) root_cr3: u64,
     pub(crate) regs: GuestRegs,
 
@@ -153,7 +152,6 @@ pub struct Vcpu {
     pub(crate) capabilities: IntelCapabilities,
     vmxon_permit: VmxonPermit,
     pub(crate) original_controls: OriginalControlRegisters,
-    pub(crate) original_debug: crate::lifecycle::DebugState,
     launch_error: Option<MonadError>,
     pub(crate) cpu: CpuId,
     // teardown waits for vmxoff before freeing this vcpu.
@@ -415,6 +413,7 @@ unsafe fn init_xsave_area(vcpu: *mut Vcpu) -> bool {
         (*vcpu).xsave_area = aligned;
         (*vcpu).xsave_size = size;
         (*vcpu).xsave_mask = (*vcpu).capabilities.xsave.state_mask;
+        (*vcpu).root_xcr0 = (*vcpu).capabilities.xsave.xcr0_mask;
     }
     true
 }
@@ -1840,6 +1839,10 @@ unsafe fn stop_cpu(vcpu: *mut Vcpu) -> ! {
         (*vcpu).regs.rflags = rflags;
     }
 
+    let native = match NativeReturnState::capture(vmread) {
+        Ok(state) => state,
+        Err(_) => unsafe { fatal_vmexit(vcpu, FatalReason::InvalidVcpuState) },
+    };
     unsafe { vmxoff_or_fatal(vcpu) };
 
     // vmxoff makes this vcpu unreachable to hardware.
@@ -1849,15 +1852,22 @@ unsafe fn stop_cpu(vcpu: *mut Vcpu) -> ! {
         write_msr(IA32_SYSENTER_CS, guest_sysenter_cs);
         write_msr(IA32_SYSENTER_ESP, guest_sysenter_esp);
         write_msr(IA32_SYSENTER_EIP, guest_sysenter_eip);
-        write_cr0(guest_cr0);
         write_cr3(guest_cr3);
         write_cr4((guest_cr4 & !(1 << 13)) | ((*vcpu).original_controls.cr4 & (1 << 13)));
-        let mut debug = (*vcpu).original_debug;
-        debug.dr7 = guest_dr7;
-        write_debug_state(debug);
+        native.restore();
+        // DR0-3/6 stay live throughout root execution; startup values are obsolete.
+        write_dr7(guest_dr7);
     }
 
-    unsafe { restore_guest(&(*vcpu).regs, (*vcpu).xsave_area, (*vcpu).xsave_mask) }
+    unsafe {
+        restore_guest(
+            &(*vcpu).regs,
+            (*vcpu).xsave_area,
+            (*vcpu).xsave_mask,
+            (*vcpu).guest_xcr0,
+            guest_cr0,
+        )
+    }
 }
 
 #[cfg(not(test))]
@@ -1943,7 +1953,6 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
         }
     };
     unsafe { (*vcpu).original_controls = original };
-    unsafe { (*vcpu).original_debug = read_debug_state() };
 
     if let Err(error) = vmxon(unsafe { (*vcpu).vmxon_pa }, unsafe { (*vcpu).vmxon_permit }) {
         restore_control_registers(original);
@@ -1986,6 +1995,8 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
     if let Err(error) = unsafe { vmlaunch(&mut (*vcpu).regs) } {
         unsafe { vmxoff_or_fatal(vcpu) };
         unsafe { (*vcpu).active.store(false, Ordering::Release) };
+        // Failed initial entry returned with the root mask; native caller owns the original.
+        crate::arch::intel::state::restore_native_xcr0(unsafe { (*vcpu).guest_xcr0 });
         restore_control_registers(original);
         return Err(error.on_cpu(cpu_index));
     }
