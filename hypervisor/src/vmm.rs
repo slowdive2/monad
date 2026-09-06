@@ -135,6 +135,7 @@ pub struct Vcpu {
     pub(crate) xsave_area: *mut u8,
     pub(crate) xsave_size: u32,
     pub(crate) xsave_mask: u64,
+    pub(crate) root_cr3: u64,
     pub(crate) regs: GuestRegs,
 
     pub(crate) active_view: ActiveViewState,
@@ -153,6 +154,7 @@ pub struct Vcpu {
     vmxon_permit: VmxonPermit,
     pub(crate) original_controls: OriginalControlRegisters,
     pub(crate) original_debug: crate::lifecycle::DebugState,
+    launch_error: Option<MonadError>,
     pub(crate) cpu: CpuId,
     // teardown waits for vmxoff before freeing this vcpu.
     active: AtomicBool,
@@ -486,6 +488,7 @@ unsafe fn init_vcpu(
     };
 
     unsafe {
+        (*vcpu).launch_error = None;
         (*vcpu).capabilities = platform.capabilities;
         (*vcpu).vmxon_permit = platform.vmxon_permit();
         (*vcpu).cpu = cpu;
@@ -1399,7 +1402,10 @@ unsafe extern "C" fn launch_cpu(context: u64) -> u64 {
         launch.failed.store(true, Ordering::Release);
     } else {
         let dense = unsafe { (*vcpu).cpu.dense_index };
-        if unsafe { init_cpu(vcpu, u32::from(dense)) }.is_err() {
+        if let Err(error) = unsafe { init_cpu(vcpu, u32::from(dense)) } {
+            unsafe {
+                (*vcpu).launch_error = Some(error);
+            }
             launch.failed.store(true, Ordering::Release);
         }
     }
@@ -1543,6 +1549,7 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         ));
     }
     let platform = collect_capabilities()?;
+    let root_cr3 = crate::arch::intel::state::system_cr3()?;
     let architectural_limit = 1u64 << platform.capabilities.max_physical_address_bits;
     let configured_limit = if config.aperture_limit == 0 {
         DEFAULT_APERTURE_END.min(architectural_limit)
@@ -1651,6 +1658,7 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         }
         unsafe {
             if !vcpu.is_null() {
+                (*vcpu).root_cr3 = root_cr3;
                 (*vcpu).published_views = core::ptr::from_ref(&(*ctx).published_views);
             }
             *(*ctx).vcpus.add(i as usize) = vcpu;
@@ -1722,12 +1730,15 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         ));
     }
     if launch.failed.load(Ordering::Acquire) {
+        let error =
+            (0..cpu_count).find_map(|i| unsafe { (**(*ctx).vcpus.add(i as usize)).launch_error });
+        if let Some(error) = error {
+            log::error!("launch failed: {error:?}");
+        }
         unsafe { free_vmm(ctx) };
-        return Err(MonadError::new(
-            ErrorPhase::Launch,
-            ErrorCode::VmxInstructionFailure,
-            0,
-        ));
+        return Err(error.unwrap_or_else(|| {
+            MonadError::new(ErrorPhase::Launch, ErrorCode::VmxInstructionFailure, 0)
+        }));
     }
 
     start_transition
@@ -1928,7 +1939,6 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
     let original = match prepare_control_registers(unsafe { &(*vcpu).capabilities }) {
         Ok(original) => original,
         Err(error) => {
-            log::error!("control-register preparation failed on processor {cpu}: {error:?}");
             return Err(error.on_cpu(cpu_index));
         }
     };
@@ -1936,7 +1946,6 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
     unsafe { (*vcpu).original_debug = read_debug_state() };
 
     if let Err(error) = vmxon(unsafe { (*vcpu).vmxon_pa }, unsafe { (*vcpu).vmxon_permit }) {
-        log::error!("VMXON instruction failed on vcpu {:p}: {error:?}", vcpu);
         restore_control_registers(original);
         return Err(error.on_cpu(cpu_index));
     }
@@ -1944,18 +1953,16 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
     let guest_desc = match unsafe { Descriptors::capture_current() } {
         Ok(descriptors) => descriptors,
         Err(error) => {
-            log::error!("guest descriptor capture failed on processor {cpu}: {error:?}");
             unsafe { vmxoff_or_fatal(vcpu) };
             restore_control_registers(original);
             return Err(error.on_cpu(cpu_index));
         }
     };
     (*vcpu).guest_desc = guest_desc;
-    // the host still shares the guest's address space.
+    // Per-CPU kernel descriptors are retained; root paging belongs to the system process.
     let host_desc = match unsafe { Descriptors::capture_current() } {
         Ok(descriptors) => descriptors,
         Err(error) => {
-            log::error!("host descriptor capture failed on processor {cpu}: {error:?}");
             unsafe { vmxoff_or_fatal(vcpu) };
             restore_control_registers(original);
             return Err(error.on_cpu(cpu_index));
@@ -1963,14 +1970,11 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
     };
     (*vcpu).host_desc = host_desc;
 
-    log::info!("vcpu {:p} in VMX operation on processor {}", vcpu, cpu);
-
     unsafe { capture_registers(&mut (*vcpu).regs) };
 
     match unsafe { setup_vmcs(vcpu) } {
         Ok(()) => {}
         Err(error) => {
-            log::error!("VMCS instruction failed on processor {}: {error:?}", cpu);
             unsafe { vmxoff_or_fatal(vcpu) };
             restore_control_registers(original);
             return Err(error.on_cpu(cpu_index));
@@ -1980,7 +1984,6 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
     // hardware may touch vmx allocations until vmxoff.
     unsafe { (*vcpu).active.store(true, Ordering::Release) };
     if let Err(error) = unsafe { vmlaunch(&mut (*vcpu).regs) } {
-        log::error!("VMLAUNCH failed on processor {cpu}: {error:?}");
         unsafe { vmxoff_or_fatal(vcpu) };
         unsafe { (*vcpu).active.store(false, Ordering::Release) };
         restore_control_registers(original);

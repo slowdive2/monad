@@ -395,7 +395,7 @@ pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) -> MonadResult<()> {
         *(host_rsp as *mut *mut Vcpu) = vcpu_ptr;
         setup_host_state(
             &vcpu.host_desc,
-            read_cr3(),
+            vcpu.root_cr3,
             host_rsp as u64,
             vmexit_entry as *const () as usize as u64,
         )?;

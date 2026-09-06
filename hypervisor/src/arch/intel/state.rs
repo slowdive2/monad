@@ -297,6 +297,52 @@ pub(crate) fn write_cr0(value: u64) {
     };
 }
 
+/// Capture the system process's kernel root while briefly attached at PASSIVE_LEVEL.
+pub(crate) fn system_cr3() -> MonadResult<u64> {
+    use wdk_sys::{
+        ntddk::{KeGetCurrentIrql, KeStackAttachProcess, KeUnstackDetachProcess},
+        KAPC_STATE, PEPROCESS,
+    };
+    if unsafe { KeGetCurrentIrql() } != 0 {
+        return Err(MonadError::new(
+            ErrorPhase::Launch,
+            ErrorCode::InvalidLifecycleState,
+            0,
+        ));
+    }
+    // COFF data imports have no function thunk. Bind the IAT slot explicitly;
+    // the generated wdk-sys declaration omits dllimport for this exported variable.
+    unsafe extern "system" {
+        #[link_name = "__imp_PsInitialSystemProcess"]
+        static SYSTEM_PROCESS_IMPORT: *const PEPROCESS;
+    }
+    let process = unsafe { *SYSTEM_PROCESS_IMPORT };
+    if process.is_null() {
+        return Err(MonadError::new(
+            ErrorPhase::Launch,
+            ErrorCode::InvalidGuestState,
+            0,
+        ));
+    }
+    let mut apc = unsafe { core::mem::zeroed::<KAPC_STATE>() };
+    // No allocation, I/O or fallible operation occurs while attached.
+    unsafe {
+        KeStackAttachProcess(process.cast(), &mut apc);
+    }
+    let root = read_cr3() & !0xfff;
+    unsafe {
+        KeUnstackDetachProcess(&mut apc);
+    }
+    if root == 0 {
+        return Err(MonadError::new(
+            ErrorPhase::Launch,
+            ErrorCode::InvalidGuestState,
+            0,
+        ));
+    }
+    Ok(root)
+}
+
 pub(crate) fn read_cr3() -> u64 {
     // safety: monad calls this only from cpl0 kernel context.
     unsafe { x86::controlregs::cr3() }
