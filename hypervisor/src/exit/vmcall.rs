@@ -11,7 +11,8 @@ use crate::arch::intel::{
 };
 use crate::error::MonadResult;
 use crate::rendezvous::{
-    switch_view, MailboxValidation, RendezvousOperation, SwitchStep, ViewSwitchBackend,
+    switch_view, MailboxValidation, RendezvousOperation, SwitchFailure, SwitchStep,
+    ViewSwitchBackend,
 };
 use crate::topology::CpuId;
 use crate::vmm::Vcpu;
@@ -103,15 +104,22 @@ pub(super) unsafe fn handle(vcpu: &mut Vcpu) -> ExitDisposition {
         &mut hardware,
     );
     vcpu.active_report.publish(vcpu.active_view);
-    match (request.operation, result) {
-        (_, Ok(())) => ExitDisposition::ResumeAndAdvance,
-        (RendezvousOperation::SwitchView, Err(_)) => ExitDisposition::ResumeAndAdvance,
-        (RendezvousOperation::RollbackView, Err(_)) => {
-            ExitDisposition::Fatal(FatalReason::InvalidVcpuState)
+    switch_disposition(request.operation, result)
+}
+
+/// Shared with failure-injection tests; never infer recovery from software state.
+pub(crate) fn switch_disposition(
+    operation: RendezvousOperation,
+    result: Result<(), SwitchFailure>,
+) -> ExitDisposition {
+    match result {
+        Ok(()) => ExitDisposition::ResumeAndAdvance,
+        Err(failure)
+            if operation == RendezvousOperation::SwitchView && failure.recovery.is_none() =>
+        {
+            ExitDisposition::ResumeAndAdvance
         }
-        (RendezvousOperation::Shutdown, Err(_)) => {
-            ExitDisposition::Fatal(FatalReason::InvalidVcpuState)
-        }
+        Err(_) => ExitDisposition::Fatal(FatalReason::RendezvousRollbackFailure),
     }
 }
 
