@@ -873,9 +873,10 @@ pub fn lifecycle_allows(code: u32, state: LifecycleState) -> bool {
         | IOCTL_APPLY_EDIT_BATCH
         | IOCTL_DISCARD_DRAFT
         | IOCTL_PUBLISH_VIEW => state == LifecycleState::Running,
-        IOCTL_QUERY_MAPPING | IOCTL_LIST_VIEWS | IOCTL_READ_EVENTS | IOCTL_GET_VCPU_STATE => {
-            state == LifecycleState::Running
+        IOCTL_READ_EVENTS | IOCTL_GET_VCPU_STATE => {
+            matches!(state, LifecycleState::Running | LifecycleState::Absent)
         }
+        IOCTL_QUERY_MAPPING | IOCTL_LIST_VIEWS => state == LifecycleState::Running,
         IOCTL_ACTIVATE_VIEW => state == LifecycleState::Running,
         _ => false,
     }
@@ -1171,6 +1172,19 @@ mod tests {
                 .code,
             ErrorCode::WrongSession
         );
+    }
+
+    #[test]
+    fn stopped_evidence_remains_readable() {
+        assert!(lifecycle_allows(IOCTL_READ_EVENTS, LifecycleState::Absent));
+        assert!(lifecycle_allows(
+            IOCTL_GET_VCPU_STATE,
+            LifecycleState::Absent
+        ));
+        assert!(!lifecycle_allows(
+            IOCTL_APPLY_EDIT_BATCH,
+            LifecycleState::Absent
+        ));
     }
 
     #[test]

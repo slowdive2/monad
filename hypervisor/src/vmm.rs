@@ -1296,17 +1296,8 @@ unsafe fn activate_base(ctx: *mut Vmm) -> MonadResult<()> {
     let base_eptp = unsafe { (*ctx).published_views.resolve(base_id) }.ok_or_else(|| {
         MonadError::new(ErrorPhase::Shutdown, ErrorCode::EptVerificationFailure, 0)
     })?;
-    let mut targets = Vec::new();
-    targets
-        .try_reserve_exact(usize::from(cpu_count))
-        .map_err(|_| {
-            MonadError::new(
-                ErrorPhase::Shutdown,
-                ErrorCode::AllocationFailure,
-                u64::from(cpu_count),
-            )
-        })?;
-    targets.extend(0..cpu_count);
+    let targets: [u16; crate::topology::MAX_LOGICAL_CPUS] =
+        core::array::from_fn(|index| index as u16);
     let epoch = unsafe { (*ctx).epoch.fetch_add(1, Ordering::AcqRel) }
         .checked_add(1)
         .filter(|epoch| *epoch != 0)
@@ -1321,7 +1312,12 @@ unsafe fn activate_base(ctx: *mut Vmm) -> MonadResult<()> {
     let deadline = now
         .checked_add(unsafe { (*ctx).rendezvous_tsc_budget })
         .ok_or_else(|| MonadError::new(ErrorPhase::Shutdown, ErrorCode::AddressOverflow, now))?;
-    let transaction = RendezvousTransaction::new(epoch, cpu_count, &targets, deadline)?;
+    let transaction = RendezvousTransaction::new(
+        epoch,
+        cpu_count,
+        &targets[..usize::from(cpu_count)],
+        deadline,
+    )?;
     let target = ActiveViewState {
         id: base_id,
         eptp: base_eptp,
@@ -1510,7 +1506,7 @@ unsafe extern "C" fn launch_cpu(context: u64) -> u64 {
     1
 }
 
-/// stops all vcpus and frees vmm-owned state.
+/// stops all vcpus; retains one stopped instance for final evidence until START or close.
 ///
 /// # Safety
 ///
@@ -1521,6 +1517,9 @@ pub unsafe fn vmm_shutdown() -> MonadResult<()> {
     let lifecycle_guard = LIFECYCLE.try_control()?;
 
     let ctx = VMM.load(Ordering::Acquire);
+    if lifecycle_guard.state() == LifecycleState::Absent {
+        return Ok(());
+    }
     if ctx.is_null() {
         return if lifecycle_guard.state() == LifecycleState::Absent {
             Ok(())
@@ -1552,10 +1551,56 @@ pub unsafe fn vmm_shutdown() -> MonadResult<()> {
         ));
     }
 
-    VMM.store(null_mut(), Ordering::Release);
-    unsafe { free_vmm(ctx) };
+    // Retain one stopped instance so final records can be drained by this controller.
     lifecycle_guard.transition(LifecycleState::Stopping, LifecycleState::Absent)?;
     Ok(())
+}
+
+unsafe fn release_retained() -> MonadResult<()> {
+    let ctx = VMM.load(Ordering::Acquire);
+    if ctx.is_null() {
+        return Ok(());
+    }
+    for i in 0..unsafe { (*ctx).cpu_count } {
+        let vcpu = unsafe { *(*ctx).vcpus.add(i as usize) };
+        if !vcpu.is_null() && unsafe { (*vcpu).active.load(Ordering::Acquire) } {
+            return Err(MonadError::new(
+                ErrorPhase::Shutdown,
+                ErrorCode::ShutdownFailure,
+                u64::from(i),
+            ));
+        }
+    }
+    VMM.store(null_mut(), Ordering::Release);
+    unsafe {
+        free_vmm(ctx);
+    }
+    Ok(())
+}
+
+/// Final owner release: returning while hardware can reach the driver is forbidden.
+///
+/// # Safety
+/// PASSIVE_LEVEL, no outstanding controller requests, and no new admission.
+pub unsafe fn shutdown_and_release() {
+    let result = unsafe { vmm_shutdown() }.and_then(|()| {
+        let control = LIFECYCLE.try_control()?;
+        if control.state() != LifecycleState::Absent {
+            return Err(MonadError::new(
+                ErrorPhase::Shutdown,
+                ErrorCode::InvalidLifecycleState,
+                control.state() as u64,
+            ));
+        }
+        unsafe { release_retained() }
+    });
+    if let Err(error) = result {
+        LIFECYCLE.enter_fatal();
+        #[cfg(not(test))]
+        fatal_rendezvous(error.cpu_dense_index, error.code as u64);
+        #[cfg(test)]
+        panic!("final teardown failed: {error:?}");
+    }
 }
 
 /// starts the vmm on the startup cpu snapshot. later cpus stay native.
@@ -1571,12 +1616,9 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         committed: false,
     };
 
-    if !VMM.load(Ordering::Acquire).is_null() {
-        return Err(MonadError::new(
-            ErrorPhase::Launch,
-            ErrorCode::InvalidLifecycleState,
-            0,
-        ));
+    // The lifecycle guard proved Absent before entering Preparing.
+    unsafe {
+        release_retained()?;
     }
 
     if config.session_nonce == 0 || config.rendezvous_timeout_tsc == 0 {
@@ -1783,7 +1825,7 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         if let Some(error) = error {
             log::error!("launch failed: {error:?}");
         }
-        unsafe { free_vmm(ctx) };
+        VMM.store(ctx, Ordering::Release);
         return Err(error.unwrap_or_else(|| {
             MonadError::new(ErrorPhase::Launch, ErrorCode::VmxInstructionFailure, 0)
         }));
