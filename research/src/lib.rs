@@ -420,11 +420,11 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                             "must be 64 lowercase hexadecimal characters",
                         );
                     }
-                    if !matches!(*memory_type, 0 | 1 | 4 | 5 | 6) {
+                    if *memory_type != 6 {
                         issue(
                             &mut issues,
                             format!("{edit_path}.memory_type"),
-                            "must be an architectural EPT memory type: 0, 1, 4, 5, or 6",
+                            "cached backing remaps require memory type 6 (write-back)",
                         );
                     }
                 }
