@@ -40,8 +40,6 @@ const DOS_NAME: &str = "\\DosDevices\\MonadResearch";
 const IO_NO_INCREMENT: i8 = 0;
 const STATUS_INVALID_DEVICE_REQUEST: NTSTATUS = 0xC000_0010u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009Au32 as i32;
-const STATUS_DEVICE_BUSY: NTSTATUS = 0xC000_009Eu32 as i32;
-const CLOSE_SPIN_LIMIT: usize = 1_000_000;
 
 static SESSION: ControllerSession = ControllerSession::new();
 
@@ -202,40 +200,39 @@ unsafe extern "C" fn dispatch_create(_device: *mut DEVICE_OBJECT, irp: PIRP) -> 
 }
 
 unsafe extern "C" fn dispatch_cleanup(_device: *mut DEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    let status = unsafe { close_session() };
-    unsafe { complete(irp, status, 0) }
+    // Windows owns outstanding I/O until IRP_MJ_CLOSE. Quiesce new admission now.
+    let nonce = SESSION.active_nonce();
+    if nonce != 0 {
+        if let Err(error) = SESSION.begin_close(nonce) {
+            return unsafe { complete(irp, ioctl::ntstatus(error), 0) };
+        }
+    }
+    unsafe { complete(irp, STATUS_SUCCESS, 0) }
 }
 
 unsafe extern "C" fn dispatch_close(_device: *mut DEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    let status = unsafe { close_session() };
-    unsafe { complete(irp, status, 0) }
-}
-
-unsafe fn close_session() -> NTSTATUS {
     let nonce = SESSION.active_nonce();
-    if nonce == 0 {
-        return STATUS_SUCCESS;
-    }
-    let drain = match SESSION.begin_close(nonce) {
-        Ok(value) => value,
-        Err(error) => return ioctl::ntstatus(error),
-    };
-    for _ in 0..CLOSE_SPIN_LIMIT {
-        if drain.is_drained() {
-            if hypervisor::vmm::lifecycle_state() == hypervisor::lifecycle::LifecycleState::Running
-            {
-                if let Err(error) = unsafe { hypervisor::vmm::vmm_shutdown() } {
-                    return ioctl::ntstatus(error);
+    if nonce != 0 {
+        {
+            let drain = SESSION.close_owner();
+            // WDM close arrives only after outstanding I/O has completed/cancelled.
+            // No spin, blocking dependency, or abandoned asynchronous owner.
+            if !drain.is_drained() {
+                unsafe {
+                    wdk_sys::ntddk::KeBugCheckEx(0x4d4e4431, 12, 0, 0, 0);
                 }
             }
-            return match drain.finish() {
-                Ok(()) => STATUS_SUCCESS,
-                Err(error) => ioctl::ntstatus(error),
-            };
+            unsafe {
+                hypervisor::vmm::shutdown_and_release();
+            }
+            if drain.finish().is_err() {
+                unsafe {
+                    wdk_sys::ntddk::KeBugCheckEx(0x4d4e4431, 12, 1, 0, 0);
+                }
+            }
         }
-        core::hint::spin_loop();
     }
-    STATUS_DEVICE_BUSY
+    unsafe { complete(irp, STATUS_SUCCESS, 0) }
 }
 
 unsafe extern "C" fn dispatch_device_control(_device: *mut DEVICE_OBJECT, irp: PIRP) -> NTSTATUS {

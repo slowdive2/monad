@@ -1,6 +1,7 @@
 extern crate alloc;
 
-use alloc::{boxed::Box, vec::Vec};
+#[cfg(test)]
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::ept::ViewId;
@@ -165,7 +166,7 @@ pub struct RendezvousTransaction {
     pub failed: AtomicBool,
     pub fatal: AtomicBool,
     pub release: AtomicBool,
-    pub per_cpu: Box<[RendezvousCpuResult]>,
+    pub per_cpu: [RendezvousCpuResult; MAX_LOGICAL_CPUS],
     deadline_tsc: u64,
 }
 
@@ -208,17 +209,6 @@ impl RendezvousTransaction {
                 0,
             ));
         }
-        let mut results = Vec::new();
-        results
-            .try_reserve_exact(usize::from(participant_count))
-            .map_err(|_| {
-                MonadError::new(
-                    ErrorPhase::Rendezvous,
-                    ErrorCode::AllocationFailure,
-                    u64::from(participant_count),
-                )
-            })?;
-        results.extend((0..participant_count).map(|_| RendezvousCpuResult::new()));
         Ok(Self {
             epoch,
             target_mask,
@@ -229,7 +219,7 @@ impl RendezvousTransaction {
             failed: AtomicBool::new(false),
             fatal: AtomicBool::new(false),
             release: AtomicBool::new(false),
-            per_cpu: results.into_boxed_slice(),
+            per_cpu: core::array::from_fn(|_| RendezvousCpuResult::new()),
             deadline_tsc,
         })
     }

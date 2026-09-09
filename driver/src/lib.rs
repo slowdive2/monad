@@ -48,8 +48,8 @@ pub unsafe extern "system" fn driver_entry(
 
 #[cfg(not(test))]
 unsafe extern "C" fn driver_exit(driver: *mut DRIVER_OBJECT) {
-    if hypervisor::vmm::lifecycle_state() == hypervisor::lifecycle::LifecycleState::Running {
-        let _ = unsafe { hypervisor::vmm::vmm_shutdown() };
+    unsafe {
+        hypervisor::vmm::shutdown_and_release();
     }
     unsafe { device::destroy(driver) };
 }
