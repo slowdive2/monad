@@ -569,7 +569,6 @@ fn edit_from_wire(
                 ));
             }
             let memory_type = match value.memory_type {
-                0 => hypervisor::ept::BackingMemoryType::Uncacheable,
                 6 => hypervisor::ept::BackingMemoryType::WriteBack,
                 other => {
                     return Err(MonadError::new(

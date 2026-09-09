@@ -384,7 +384,7 @@ mod tests {
         FakePageAllocator,
         Rc<FakePageStats>,
     ) {
-        let allocator = FakePageAllocator::new(0x1000_0000_0000, None);
+        let allocator = FakePageAllocator::new(0x1000_0000, None);
         let stats = Rc::clone(&allocator.stats);
         let inventory = PhysicalInventory::ingest(
             &[PhysicalRange {
@@ -697,5 +697,38 @@ mod tests {
             manager.metadata(published).expect("metadata").source,
             base_id()
         );
+    }
+    #[test]
+    fn cached_backing_rejects_uncacheable_or_uncovered_physical_aliases() {
+        let (mut manager, _, _) = manager();
+        let backing = manager.allocate_backing(1, false).expect("backing");
+        let draft = manager.create_draft(base_id()).expect("draft");
+        let gpa = GuestPhysicalAddress::from_page_aligned(0x2000).expect("gpa");
+        let reference = BackingPageReference {
+            backing_id: backing,
+            page_index: 0,
+        };
+        let edit = DraftEdit::MapBacking4K {
+            gpa,
+            backing: reference,
+            permissions: all(),
+            memory_type: super::super::BackingMemoryType::Uncacheable,
+        };
+        assert!(manager.apply_batch(draft, &[edit]).is_err());
+        // Exercise the actual candidate's physical-type lookup with an HPA outside
+        // its map; syntactically valid WB must not substitute for physical evidence.
+        let index = manager.draft_index(draft).expect("draft index");
+        let image = &mut manager.drafts[index].draft.as_mut().expect("draft").image;
+        let wb = DraftEdit::MapBacking4K {
+            gpa,
+            backing: reference,
+            permissions: all(),
+            memory_type: super::super::BackingMemoryType::WriteBack,
+        };
+        assert!(image
+            .apply_edit(wb, |_| super::super::HostPhysicalAddress::for_mapping(
+                ONE_GIB, 4096, 4096, 48
+            ))
+            .is_err());
     }
 }
