@@ -12,6 +12,8 @@ pub const EVIDENCE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const PAGE_SIZE: u64 = 0x1000;
 const DEFAULT_APERTURE_LIMIT: u64 = 1 << 39;
 pub const SUBSTRATE_ABI_VERSION: u16 = 3;
+const MAX_PUBLISHED_VIEWS: usize = 8;
+const MAX_BATCH_EDITS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -224,7 +226,13 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn validate_range(issues: &mut Vec<ValidationIssue>, path: &str, start: u64, length: u64) {
+fn validate_range(
+    issues: &mut Vec<ValidationIssue>,
+    path: &str,
+    start: u64,
+    length: u64,
+    limit: u64,
+) {
     if start & (PAGE_SIZE - 1) != 0 {
         issue(issues, format!("{path}.gpa"), "must be 4 KiB aligned");
     }
@@ -235,8 +243,14 @@ fn validate_range(issues: &mut Vec<ValidationIssue>, path: &str, start: u64, len
             "must be a nonzero multiple of 4 KiB",
         );
     }
-    if start.checked_add(length).is_none() {
-        issue(issues, path, "range overflows u64");
+    match start.checked_add(length) {
+        None => issue(issues, path, "range overflows u64"),
+        Some(end) if end > limit.min(1 << 48) => issue(
+            issues,
+            path,
+            "range exceeds the configured or architectural aperture",
+        ),
+        _ => {}
     }
 }
 
@@ -348,6 +362,13 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
         }
     }
 
+    if pack.views.len() >= MAX_PUBLISHED_VIEWS {
+        issue(
+            &mut issues,
+            "views",
+            "at most seven alternate views fit in one VMM instance",
+        );
+    }
     let mut names = HashSet::new();
     names.insert("base".to_owned());
     for (view_index, view) in pack.views.iter().enumerate() {
@@ -358,7 +379,7 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                 format!("{view_path}.name"),
                 "must be a unique identifier other than 'base'",
             );
-        } else if !names.insert(view.name.clone()) {
+        } else if names.contains(&view.name) {
             issue(
                 &mut issues,
                 format!("{view_path}.name"),
@@ -370,6 +391,14 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                 &mut issues,
                 format!("{view_path}.source"),
                 "must name base or a previously defined view",
+            );
+        }
+        names.insert(view.name.clone());
+        if view.edits.len() > MAX_BATCH_EDITS {
+            issue(
+                &mut issues,
+                format!("{view_path}.edits"),
+                "this planner supports one batch of at most 64 edits per view",
             );
         }
         if view.edits.is_empty() {
@@ -387,7 +416,7 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                     length,
                     permissions,
                 } => {
-                    validate_range(&mut issues, &edit_path, *gpa, *length);
+                    validate_range(&mut issues, &edit_path, *gpa, *length, effective_limit);
                     validate_permissions(
                         &mut issues,
                         &format!("{edit_path}.permissions"),
@@ -395,7 +424,7 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                     );
                 }
                 ViewEdit::RestoreFromBase { gpa, length } => {
-                    validate_range(&mut issues, &edit_path, *gpa, *length);
+                    validate_range(&mut issues, &edit_path, *gpa, *length, effective_limit);
                 }
                 ViewEdit::MapBacking4k {
                     gpa,
@@ -405,12 +434,19 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                     permissions,
                     memory_type,
                 } => {
-                    validate_range(&mut issues, &edit_path, *gpa, *length);
+                    validate_range(&mut issues, &edit_path, *gpa, *length, effective_limit);
                     validate_permissions(
                         &mut issues,
                         &format!("{edit_path}.permissions"),
                         *permissions,
                     );
+                    if *length != PAGE_SIZE {
+                        issue(
+                            &mut issues,
+                            format!("{edit_path}.length"),
+                            "map_backing4k is exactly one 4 KiB edit",
+                        );
+                    }
                     if artifact.trim().is_empty() {
                         issue(
                             &mut issues,
@@ -756,5 +792,38 @@ mod tests {
         assert!(output.join("experiment-pack.canonical.json").is_file());
         assert!(output.join("evidence-manifest.json").is_file());
         fs::remove_dir_all(&output).expect("remove test directory");
+    }
+    #[test]
+    fn static_plan_rejects_the_audit_counterexamples() {
+        let mut invalid = pack();
+        invalid.views[0].source = invalid.views[0].name.clone();
+        assert!(compile_plan(&invalid).is_err());
+        invalid = pack();
+        if let ViewEdit::SetPermissions { gpa, .. } = &mut invalid.views[0].edits[0] {
+            *gpa = 1 << 48;
+        }
+        assert!(compile_plan(&invalid).is_err());
+        invalid = pack();
+        for i in 1..8 {
+            let mut view = invalid.views[0].clone();
+            view.name = format!("view-{i}");
+            invalid.views.push(view);
+        }
+        assert!(compile_plan(&invalid).is_err());
+        for memory_type in [0, 1, 4, 5, 7] {
+            invalid = pack();
+            invalid.views[0].edits[0] = ViewEdit::MapBacking4k {
+                gpa: 0x2000,
+                length: PAGE_SIZE,
+                artifact: "input.bin".to_owned(),
+                artifact_sha256: "1".repeat(64),
+                permissions: 7,
+                memory_type,
+            };
+            assert!(compile_plan(&invalid).is_err());
+        }
+        invalid = pack();
+        invalid.views[0].edits = vec![invalid.views[0].edits[0].clone(); 65];
+        assert!(compile_plan(&invalid).is_err());
     }
 }
