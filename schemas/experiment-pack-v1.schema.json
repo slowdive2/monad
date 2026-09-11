@@ -59,6 +59,7 @@
     },
     "views": {
       "type": "array",
+      "maxItems": 7,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -68,6 +69,7 @@
           "source": { "$ref": "#/$defs/id" },
           "edits": {
             "type": "array",
+            "maxItems": 64,
             "minItems": 1,
             "items": { "$ref": "#/$defs/edit" }
           }
@@ -204,7 +206,7 @@
           "properties": {
             "action": { "const": "map_backing4k" },
             "gpa": { "type": "integer", "minimum": 0 },
-            "length": { "type": "integer", "minimum": 1 },
+            "length": { "const": 4096 },
             "artifact": { "type": "string", "minLength": 1 },
             "artifact_sha256": { "$ref": "#/$defs/sha256" },
             "permissions": { "type": "integer", "minimum": 0, "maximum": 7 },
