@@ -605,6 +605,80 @@ pub fn compile_plan(pack: &ExperimentPack) -> Result<ExecutionPlan, ResearchErro
     })
 }
 
+const SOURCE_FILES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo/config.toml",
+    "hypervisor/Cargo.toml",
+    "driver/Cargo.toml",
+    "driver/build.rs",
+    "research/Cargo.toml",
+    "monadctl/Cargo.toml",
+];
+const SOURCE_DIRS: &[&str] = &[
+    "hypervisor/src",
+    "driver/src",
+    "research/src",
+    "monadctl/src",
+    "tools",
+    "schemas",
+];
+
+/// Hash current source bytes, including untracked additions; examples and outputs
+/// are excluded to avoid a pack's source_sha256 becoming self-referential.
+pub fn source_digest(root: &Path) -> Result<String, ResearchError> {
+    fn collect(path: &Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "source symlinks are not supported",
+                ));
+            }
+            if kind.is_dir() {
+                collect(&entry.path(), files)?;
+            } else if kind.is_file() {
+                files.push(entry.path());
+            }
+        }
+        Ok(())
+    }
+    let mut files: Vec<_> = SOURCE_FILES.iter().map(|name| root.join(name)).collect();
+    for directory in SOURCE_DIRS {
+        collect(&root.join(directory), &mut files)?;
+    }
+    let mut entries = Vec::new();
+    for file in files {
+        let relative = file.strip_prefix(root).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source path escaped repository",
+            )
+        })?;
+        let name = relative
+            .to_str()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path is not UTF-8")
+            })?
+            .replace('\\', "/");
+        entries.push((name, file));
+    }
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut digest = Sha256::new();
+    digest.update(b"monad-source-v1\0");
+    for (name, file) in entries {
+        let bytes = fs::read(file)?;
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 pub fn prepare_evidence_bundle(
     pack: &ExperimentPack,
     output: &Path,
@@ -825,5 +899,42 @@ mod tests {
         invalid = pack();
         invalid.views[0].edits = vec![invalid.views[0].edits[0].clone(); 65];
         assert!(compile_plan(&invalid).is_err());
+    }
+
+    #[test]
+    fn source_digest_covers_new_source_but_not_evidence_outputs() {
+        let root = std::env::temp_dir().join(format!(
+            "monad-source-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        for dir in SOURCE_DIRS {
+            fs::create_dir_all(root.join(dir)).expect("source directory");
+        }
+        for file in SOURCE_FILES {
+            fs::create_dir_all(root.join(file).parent().expect("parent"))
+                .expect("parent directory");
+            fs::write(root.join(file), b"fixture").expect("source");
+        }
+        let before = source_digest(&root).expect("digest");
+        fs::write(root.join("driver/src/new.rs"), b"new implementation").expect("untracked source");
+        let after = source_digest(&root).expect("digest");
+        assert_ne!(before, after);
+        fs::create_dir(root.join("target")).expect("output directory");
+        fs::write(root.join("target/result.json"), b"evidence").expect("output");
+        assert_eq!(after, source_digest(&root).expect("stable source"));
+        assert_eq!(
+            root.canonicalize().expect("fixture").parent(),
+            Some(
+                std::env::temp_dir()
+                    .canonicalize()
+                    .expect("temp root")
+                    .as_path()
+            )
+        );
+        fs::remove_dir_all(root).expect("remove owned temporary fixture");
     }
 }

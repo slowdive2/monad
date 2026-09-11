@@ -76,16 +76,25 @@ try {
     }
 
     Invoke-NativeChecked cargo @('test', '--locked', '-p', 'monad-research', '--lib')
-    Invoke-NativeChecked cargo @(
-        'run',
-        '--locked',
-        '-p',
-        'monadctl',
-        '--',
-        'validate',
-        'examples/permission-ab.example.json'
-    )
-    Write-Output 'research-platform source gate: pass'
+    $fixture = 'examples/permission-ab.example.json'
+    Invoke-NativeChecked cargo @('run', '--locked', '-p', 'monadctl', '--', 'validate', $fixture)
+    Invoke-NativeChecked cargo @('run', '--locked', '-p', 'monadctl', '--', 'plan', $fixture, '--compact')
+    # Build a fresh preparation bundle with the current manifest identity. Keep it
+    # under target; it is preparation evidence, never an execution attestation.
+    $smoke = Join-Path $repositoryRoot ('target/research-smoke-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $smoke | Out-Null
+    $digestFile = Join-Path $smoke 'source.sha256'
+    Invoke-NativeChecked cargo @('run', '--locked', '-p', 'monadctl', '--', 'source-digest', '.', '--output', $digestFile)
+    $pack = Get-Content -LiteralPath $fixture -Raw | ConvertFrom-Json
+    $pack.source_sha256 = (Get-Content -LiteralPath $digestFile -Raw).Trim()
+    $packFile = Join-Path $smoke 'pack.json'
+    $json = $pack | ConvertTo-Json -Depth 30
+    [IO.File]::WriteAllText($packFile, $json, [Text.UTF8Encoding]::new($false))
+    $bundle = Join-Path $smoke 'bundle'
+    Invoke-NativeChecked cargo @('run', '--locked', '-p', 'monadctl', '--', 'prepare', $packFile, $bundle, '--source-digest', $digestFile)
+    $manifestFile = Join-Path $bundle 'evidence-manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestFile -PathType Leaf)) { throw 'prepare did not produce a manifest' }
+    Write-Output "research static validation and preparation workflow: pass ($smoke)"
 }
 finally {
     Pop-Location
