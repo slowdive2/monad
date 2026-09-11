@@ -11,6 +11,7 @@ pub const EXPERIMENT_PACK_SCHEMA_VERSION: u32 = 1;
 pub const EVIDENCE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const PAGE_SIZE: u64 = 0x1000;
 const DEFAULT_APERTURE_LIMIT: u64 = 1 << 39;
+pub const SUBSTRATE_ABI_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +43,8 @@ pub struct MachineSelector {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchPlan {
+    #[serde(default)]
+    pub unrestricted_edits: bool,
     /// zero selects monad's documented default limit.
     pub aperture_limit: u64,
     pub rendezvous_timeout_tsc: u64,
@@ -122,6 +125,8 @@ pub struct StopConditions {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ExecutionPlan {
+    pub substrate_abi_version: u16,
+    pub status: &'static str,
     pub schema_version: u32,
     pub experiment_id: String,
     pub pack_sha256: String,
@@ -551,6 +556,8 @@ pub fn compile_plan(pack: &ExperimentPack) -> Result<ExecutionPlan, ResearchErro
             }])
         })?;
     Ok(ExecutionPlan {
+        substrate_abi_version: SUBSTRATE_ABI_VERSION,
+        status: "static-plan-requires-machine-and-target-preflight",
         schema_version: EXPERIMENT_PACK_SCHEMA_VERSION,
         experiment_id: pack.experiment_id.clone(),
         pack_sha256: sha256_hex(&canonical),
@@ -591,6 +598,9 @@ pub fn prepare_evidence_bundle(
         total_activation_steps: plan.total_activation_steps,
         required_records: vec![
             "capabilities.json".to_owned(),
+            "loaded-driver-identity.json".to_owned(),
+            "target-bindings.json".to_owned(),
+            "stop-receipt.json".to_owned(),
             "activation-history.jsonl".to_owned(),
             "events.bin".to_owned(),
             "event-loss.json".to_owned(),
@@ -633,6 +643,7 @@ mod tests {
                 microcode: "test-microcode".to_owned(),
             },
             launch: LaunchPlan {
+                unrestricted_edits: false,
                 aperture_limit: DEFAULT_APERTURE_LIMIT,
                 rendezvous_timeout_tsc: 100,
                 device_ranges: vec![DeviceRange {

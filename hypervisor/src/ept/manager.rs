@@ -57,12 +57,12 @@ impl<A: EptPageAllocator + Clone> EptViewManager<A> {
                 0,
             ));
         }
-        let image = ViewImage::from_base(base);
+        let image = ViewImage::from_base(base, session_nonce);
         let metadata = image.verify()?;
         let base_id = ViewId {
             slot: 0,
             reserved: 0,
-            generation: 1,
+            generation: session_nonce,
         };
         let base = Box::pin(PublishedView::new(base_id, image, metadata));
         let mut published = core::array::from_fn(|_| None);
@@ -273,7 +273,7 @@ impl<A: EptPageAllocator + Clone> EptViewManager<A> {
         let view_id = ViewId {
             slot: self.next_publish_slot,
             reserved: 0,
-            generation: 1,
+            generation: self.session_nonce,
         };
         let (image, metadata) = draft.image.mark_published(draft.source, metadata);
         self.published[publish_index] =
@@ -311,7 +311,7 @@ impl<A: EptPageAllocator + Clone> EptViewManager<A> {
         ViewId {
             slot: 0,
             reserved: 0,
-            generation: 1,
+            generation: self.session_nonce,
         }
     }
 
@@ -500,7 +500,7 @@ mod tests {
         ViewId {
             slot: 0,
             reserved: 0,
-            generation: 1,
+            generation: 0x55aa,
         }
     }
 
@@ -847,6 +847,55 @@ mod tests {
         manager
             .write_backing(target, 0, &[1])
             .expect("target remains mutable before publication");
+    }
+
+    #[test]
+    fn handles_from_another_instance_cannot_select_replacement_objects() {
+        let (mut old, _, _) = manager();
+        let old_base = old.base_id();
+        let old_draft = old.create_draft(old_base).expect("old draft");
+        let old_backing = old.allocate_backing(1, false).expect("old backing");
+        let old_view = old.publish_draft(old_draft).expect("old view");
+        let (next, allocator, _) = manager();
+        // Same slots/generations, new instance; use the production constructor.
+        drop(next);
+        let inventory = PhysicalInventory::ingest(
+            &[PhysicalRange {
+                start: 0,
+                length: ONE_GIB,
+                kind: PhysicalRangeKind::Memory,
+            }],
+            &[],
+            48,
+            Some(ONE_GIB),
+        )
+        .expect("inventory");
+        let memory = NormalizedMemoryMap::from_intervals(
+            &[MemoryTypeInterval {
+                start: 0,
+                end_exclusive: ONE_GIB,
+                memory_type: EptMemoryType::WriteBack,
+            }],
+            ONE_GIB,
+        )
+        .expect("memory");
+        let base = build_base_view(allocator.clone(), inventory, memory, 48, true, true, false)
+            .expect("base");
+        let mut next =
+            EptViewManager::new(base, allocator, 0x55ab, 48, true).expect("next instance");
+        let draft = next
+            .create_draft(next.base_id())
+            .expect("replacement draft");
+        let backing = next
+            .allocate_backing(1, false)
+            .expect("replacement backing");
+        let view = next.publish_draft(draft).expect("replacement view");
+        assert_eq!(old_backing.slot, backing.slot);
+        assert_eq!(old_view.slot, view.slot);
+        assert!(next.published_view(old_base).is_err());
+        assert!(next.published_view(old_view).is_err());
+        assert!(next.discard_draft(old_draft).is_err());
+        assert!(next.free_backing(old_backing).is_err());
     }
 
     #[test]

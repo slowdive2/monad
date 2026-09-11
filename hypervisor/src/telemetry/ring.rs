@@ -14,6 +14,7 @@ const EVENT_WORDS: usize = EVENT_RECORD_BYTES / 8;
 struct AtomicEventSlot {
     words: [AtomicU64; EVENT_WORDS],
     ordinal: AtomicU64,
+    version: AtomicU64,
 }
 
 impl AtomicEventSlot {
@@ -21,37 +22,33 @@ impl AtomicEventSlot {
         Self {
             words: [const { AtomicU64::new(0) }; EVENT_WORDS],
             ordinal: AtomicU64::new(u64::MAX),
+            version: AtomicU64::new(0),
         }
     }
 
     fn publish(&self, ordinal: u64, record: EventRecord) {
         let words = record.encode_words();
-        let previous = self.words[EVENT_WORDS - 1].fetch_add(1, Ordering::AcqRel);
-        for (destination, source) in self.words[..EVENT_WORDS - 1]
-            .iter()
-            .zip(&words[..EVENT_WORDS - 1])
-        {
+        let previous = self.version.fetch_add(1, Ordering::AcqRel);
+        for (destination, source) in self.words[..].iter().zip(&words[..]) {
             destination.store(*source, Ordering::Relaxed);
         }
         self.ordinal.store(ordinal, Ordering::Relaxed);
-        self.words[EVENT_WORDS - 1].store(previous.wrapping_add(2) & !1, Ordering::Release);
+        self.version
+            .store(previous.wrapping_add(2) & !1, Ordering::Release);
     }
 
     fn snapshot(&self) -> Option<(u64, EventRecord)> {
-        let first = self.words[EVENT_WORDS - 1].load(Ordering::Acquire);
+        let first = self.version.load(Ordering::Acquire);
         if first & 1 != 0 {
             return None;
         }
         let mut words = [0u64; EVENT_WORDS];
-        for (destination, source) in words[..EVENT_WORDS - 1]
-            .iter_mut()
-            .zip(&self.words[..EVENT_WORDS - 1])
-        {
+        for (destination, source) in words[..].iter_mut().zip(&self.words[..]) {
             *destination = source.load(Ordering::Relaxed);
         }
         let ordinal = self.ordinal.load(Ordering::Relaxed);
         fence(Ordering::Acquire);
-        if self.words[EVENT_WORDS - 1].load(Ordering::Relaxed) != first {
+        if self.version.load(Ordering::Relaxed) != first {
             return None;
         }
         Some((ordinal, EventRecord::decode_words(words)))
@@ -239,5 +236,22 @@ mod tests {
             }
         }
         assert_eq!(last, 4096);
+    }
+    #[test]
+    fn attempt_identity_is_payload_not_the_ring_version_word() {
+        let ring = EventRing::try_new().expect("ring");
+        let event = EventRecord::zeroed().with_provenance(0x1234, 7, 99);
+        ring.record(event);
+        let mut output = [EventRecord::zeroed(); 1];
+        let snapshot = ring.snapshot_from(0, &mut output).expect("snapshot");
+        assert_eq!(snapshot.count, 1);
+        assert_eq!(
+            (
+                output[0].run_id,
+                output[0].view_epoch,
+                output[0].attempt_epoch
+            ),
+            (0x1234, 7, 99)
+        );
     }
 }

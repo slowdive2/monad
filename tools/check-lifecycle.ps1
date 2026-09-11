@@ -27,7 +27,8 @@ $requiredTests = @(
     'partial_shutdown_is_fatal',
     'mtrr_write_is_fatal',
     'native_return_reads_current_descriptor_and_base_state',
-    'native_control_admission_rejects_lossy_or_unimplemented_state'
+    'native_control_admission_rejects_lossy_or_unimplemented_state',
+    'instance_sequence_does_not_repeat_or_wrap'
 )
 foreach ($testName in $requiredTests) {
     if ($allText -notmatch "(?m)\b$([regex]::Escape($testName))\b") {

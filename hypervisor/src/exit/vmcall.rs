@@ -103,7 +103,25 @@ pub(super) unsafe fn handle(vcpu: &mut Vcpu) -> ExitDisposition {
         &vcpu.mailbox,
         &mut hardware,
     );
-    vcpu.active_report.publish(vcpu.active_view);
+    if result.is_ok() && !vcpu.commit_view_epoch() {
+        return ExitDisposition::Fatal(FatalReason::InvalidVcpuState);
+    }
+    let (status, detail) = result
+        .as_ref()
+        .err()
+        .map(|failure| {
+            (
+                failure.forward.code as u32,
+                failure.recovery.map(|error| error.code as u32).unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0));
+    let kind = if request.operation == RendezvousOperation::RollbackView {
+        crate::telemetry::EventKind::ViewSwitchRollback
+    } else {
+        crate::telemetry::EventKind::ViewSwitch
+    };
+    vcpu.record_transition(kind, status, detail);
     switch_disposition(request.operation, result)
 }
 

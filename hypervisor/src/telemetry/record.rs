@@ -3,7 +3,7 @@ use crate::exit::context::ExitContext;
 use crate::topology::CpuId;
 
 pub const EVENT_RECORD_BYTES: usize = 128;
-pub const EVENT_SCHEMA_VERSION: u16 = 1;
+pub const EVENT_SCHEMA_VERSION: u16 = 2;
 pub const EVENT_PROVENANCE_VALID: u32 = 1;
 
 #[repr(u8)]
@@ -49,8 +49,9 @@ pub struct EventRecord {
     pub schema_version: u16,
     pub record_size: u16,
     pub provenance_flags: u32,
-    pub activation_epoch: u64,
+    pub view_epoch: u64,
     pub run_id: u64,
+    pub attempt_epoch: u64,
 }
 
 const _: [(); EVENT_RECORD_BYTES] = [(); core::mem::size_of::<EventRecord>()];
@@ -81,8 +82,9 @@ impl EventRecord {
             schema_version: 0,
             record_size: 0,
             provenance_flags: 0,
-            activation_epoch: 0,
+            view_epoch: 0,
             run_id: 0,
+            attempt_epoch: 0,
         }
     }
 
@@ -116,15 +118,22 @@ impl EventRecord {
             schema_version: EVENT_SCHEMA_VERSION,
             record_size: EVENT_RECORD_BYTES as u16,
             provenance_flags: 0,
-            activation_epoch: 0,
+            view_epoch: 0,
             run_id: 0,
+            attempt_epoch: 0,
         }
     }
 
-    pub const fn with_provenance(mut self, run_id: u64, activation_epoch: u64) -> Self {
+    pub const fn with_provenance(
+        mut self,
+        run_id: u64,
+        view_epoch: u64,
+        attempt_epoch: u64,
+    ) -> Self {
         self.provenance_flags |= EVENT_PROVENANCE_VALID;
-        self.activation_epoch = activation_epoch;
+        self.view_epoch = view_epoch;
         self.run_id = run_id;
+        self.attempt_epoch = attempt_epoch;
         self
     }
 
@@ -150,8 +159,9 @@ impl EventRecord {
         words[12] = u64::from(self.schema_version)
             | (u64::from(self.record_size) << 16)
             | (u64::from(self.provenance_flags) << 32);
-        words[13] = self.activation_epoch;
+        words[13] = self.view_epoch;
         words[14] = self.run_id;
+        words[15] = self.attempt_epoch;
         words
     }
 
@@ -179,8 +189,9 @@ impl EventRecord {
             schema_version: words[12] as u16,
             record_size: (words[12] >> 16) as u16,
             provenance_flags: (words[12] >> 32) as u32,
-            activation_epoch: words[13],
+            view_epoch: words[13],
             run_id: words[14],
+            attempt_epoch: words[15],
         }
     }
 
@@ -203,7 +214,7 @@ impl EventRecord {
 
     pub fn encoded_reserved_is_zero(self) -> bool {
         let words = self.encode_words();
-        self.reserved0 == 0 && self.reserved1 == 0 && words[3] >> 32 == 0 && words[15] == 0
+        self.reserved0 == 0 && self.reserved1 == 0 && words[3] >> 32 == 0
     }
 }
 
@@ -226,11 +237,11 @@ mod tests {
         record.kind = EventKind::EptViolation as u8;
         record.schema_version = EVENT_SCHEMA_VERSION;
         record.record_size = EVENT_RECORD_BYTES as u16;
-        record = record.with_provenance(0x1234, 9);
+        record = record.with_provenance(0x1234, 9, 13);
         let decoded = EventRecord::decode_words(record.encode_words());
         assert_eq!(decoded, record);
         assert_eq!(decoded.run_id, 0x1234);
-        assert_eq!(decoded.activation_epoch, 9);
+        assert_eq!(decoded.view_epoch, 9);
         assert_eq!(decoded.provenance_flags, EVENT_PROVENANCE_VALID);
         assert!(decoded.encoded_reserved_is_zero());
     }

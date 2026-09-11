@@ -195,7 +195,10 @@ fn switch_local_view(vcpu: &mut Vcpu, view: crate::ept::ViewId) -> Result<(), Fa
     }
     vcpu.active_view.id = view;
     vcpu.active_view.eptp = target;
-    vcpu.active_report.publish(vcpu.active_view);
+    if !vcpu.commit_view_epoch() {
+        return Err(FatalReason::InvalidVcpuState);
+    }
+    vcpu.record_transition(EventKind::ViewSwitch, 0, 1);
     Ok(())
 }
 
