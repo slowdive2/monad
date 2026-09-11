@@ -3,8 +3,10 @@
 monad is an experimental Intel VT-x hypervisor for studying second-level
 address translation on a running x86-64 Windows system.
 
-the core rule is simple: build and verify a complete EPT view before a
-processor can use it, then never edit that published hierarchy in place.
+at its core...: build and verify a complete EPT view before use by a processor, then the published hierarchy is immutable in place
+
+monad is a consolidation of arrow-base (ideas/implementations of a base hypervisor spanning 2026 til sept 2026) : therefore , this substrate 
+initially committed as one monolithic import. actual qualification/research has been tracked incrementally from there
 
 the current base includes:
 
@@ -19,10 +21,10 @@ the current base includes:
 - deterministic experiment-pack validation through `monad-research` and
   `monadctl`.
 
-monad does not provide instruction hooks, executable shadow pages, monitor-trap
-replay, a public VMCALL service, DMA isolation, or Hyper-V coexistence. it is
-research software, and full real-hardware and long-duration qualification is
-still pending.
+monad does not provide:
+instruction hooks, executable shadow pages, monitor-trap replay, 
+a public VMCALL service, DMA isolation, or Hyper-V coexistence. full 
+real-hardware and long-duration qualification is tbd
 
 ## layout
 
