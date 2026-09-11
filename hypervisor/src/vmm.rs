@@ -699,6 +699,14 @@ pub unsafe fn allocate_backing(page_count: u32, immutable: bool) -> MonadResult<
     unsafe { &mut *running_manager()? }.allocate_backing(page_count, immutable)
 }
 
+/// Register and pin an allocated page as a default-profile experiment target.
+///
+/// # Safety
+/// Caller holds the serialized controller token at PASSIVE_LEVEL.
+pub unsafe fn register_target(id: BackingId, page: u32) -> MonadResult<GuestPhysicalAddress> {
+    unsafe { &mut *running_manager()? }.register_target(id, page)
+}
+
 /// writes bytes into mutable backing.
 ///
 /// # Safety
@@ -1670,6 +1678,7 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         WindowsPageAllocator,
         config.session_nonce,
         platform.capabilities.max_physical_address_bits,
+        true,
     )?;
     let base_id = ViewId {
         slot: 0,
