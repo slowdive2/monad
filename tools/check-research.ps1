@@ -35,13 +35,13 @@ try {
     }
 
     $abi = Get-Content -LiteralPath 'driver/src/ioctl.rs' -Raw
-    if ($abi -notmatch 'pub const ABI_VERSION: u16 = 2;' -or
+    if ($abi -notmatch 'pub const ABI_VERSION: u16 = 3;' -or
         $abi -notmatch 'DevicePhysicalRangeWire') {
-        throw 'research-platform launch inventory is not present in abi v2'
+        throw 'research-platform launch inventory is not present in abi v3'
     }
 
     $telemetry = Get-Content -LiteralPath 'hypervisor/src/telemetry/record.rs' -Raw
-    foreach ($field in @('schema_version', 'record_size', 'activation_epoch', 'run_id')) {
+    foreach ($field in @('schema_version', 'record_size', 'view_epoch', 'attempt_epoch', 'run_id')) {
         if ($telemetry -notmatch [regex]::Escape("pub $($field):")) {
             throw "research-platform telemetry provenance field is missing: $field"
         }

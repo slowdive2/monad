@@ -41,6 +41,7 @@
       "additionalProperties": false,
       "required": ["aperture_limit", "rendezvous_timeout_tsc", "device_ranges"],
       "properties": {
+        "unrestricted_edits": { "type": "boolean", "default": false },
         "aperture_limit": {
           "type": "integer",
           "minimum": 0,

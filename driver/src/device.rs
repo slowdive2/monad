@@ -287,6 +287,7 @@ fn execute(code: u32, input: &[u8], output: &mut [u8]) -> (NTSTATUS, usize) {
         Ok(value) => value,
         Err(error) => return write_error(code, input, output, error),
     };
+    let before_identity = hypervisor::vmm::instance_identity();
     let result = match code {
         IOCTL_GET_CAPS => execute_get_caps(validated.header, output),
         IOCTL_START_VMM => {
@@ -309,6 +310,9 @@ fn execute(code: u32, input: &[u8], output: &mut [u8]) -> (NTSTATUS, usize) {
                 unsafe {
                     hypervisor::vmm::vmm_init(hypervisor::vmm::VmmStartConfig {
                         session_nonce: SESSION.active_nonce(),
+                        unrestricted_edits: request.experiment_flags
+                            & ioctl::EXPERIMENT_UNRESTRICTED_EDITS
+                            != 0,
                         aperture_limit: request.aperture_limit,
                         rendezvous_timeout_tsc: request.rendezvous_timeout_tsc,
                         device_ranges,
@@ -320,6 +324,7 @@ fn execute(code: u32, input: &[u8], output: &mut [u8]) -> (NTSTATUS, usize) {
         IOCTL_STOP_VMM => {
             unsafe { hypervisor::vmm::vmm_shutdown() }.map(|()| size_of::<ResponseHeader>())
         }
+        ioctl::IOCTL_REGISTER_TARGET => execute_register_target(validated.header, input, output),
         IOCTL_ALLOCATE_BACKING => execute_allocate_backing(validated.header, input, output),
         IOCTL_WRITE_BACKING => execute_write_backing(input).map(|()| size_of::<ResponseHeader>()),
         IOCTL_FREE_BACKING => execute_free_backing(input).map(|()| size_of::<ResponseHeader>()),
@@ -340,6 +345,32 @@ fn execute(code: u32, input: &[u8], output: &mut [u8]) -> (NTSTATUS, usize) {
             u64::from(code),
         )),
     };
+    if matches!(code, IOCTL_START_VMM | IOCTL_STOP_VMM | IOCTL_ACTIVATE_VIEW) {
+        let identity = hypervisor::vmm::instance_identity();
+        let mut response = ioctl::StartVmmResponse {
+            header: ResponseHeader::success::<ioctl::StartVmmResponse>(
+                validated.header,
+                SESSION.active_nonce(),
+            ),
+            instance_id: identity.0,
+            attempt_epoch: if identity != before_identity {
+                identity.1
+            } else {
+                0
+            },
+        };
+        let status = match result {
+            Ok(_) => STATUS_SUCCESS,
+            Err(error) => {
+                response.header.error = error.into();
+                ioctl::ntstatus(error)
+            }
+        };
+        return match ioctl::write_pod(output, &response) {
+            Ok(size) => (status, size),
+            Err(error) => write_error(code, input, output, error),
+        };
+    }
     match result {
         Ok(size) => {
             let header =
@@ -347,6 +378,7 @@ fn execute(code: u32, input: &[u8], output: &mut [u8]) -> (NTSTATUS, usize) {
             if !matches!(
                 code,
                 IOCTL_GET_CAPS
+                    | ioctl::IOCTL_REGISTER_TARGET
                     | IOCTL_ALLOCATE_BACKING
                     | IOCTL_CREATE_DRAFT
                     | IOCTL_PUBLISH_VIEW
@@ -475,6 +507,27 @@ fn execute_allocate_backing(
         backing: backing_to_wire(backing),
     };
     ioctl::write_pod(output, &response)
+}
+
+fn execute_register_target(
+    header: ioctl::RequestHeader,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<usize, MonadError> {
+    let request = ioctl::read_pod::<ioctl::RegisterTargetRequest>(input, 0)?;
+    let gpa = unsafe {
+        hypervisor::vmm::register_target(backing_from_wire(request.backing), request.page_index)
+    }?;
+    ioctl::write_pod(
+        output,
+        &ioctl::RegisterTargetResponse {
+            header: ResponseHeader::success::<ioctl::RegisterTargetResponse>(
+                header,
+                SESSION.active_nonce(),
+            ),
+            gpa: gpa.get(),
+        },
+    )
 }
 
 fn execute_write_backing(input: &[u8]) -> Result<(), MonadError> {
@@ -937,7 +990,8 @@ fn execute_get_vcpu_state(
         last_fatal: state.last_fatal,
         last_mailbox: state.last_mailbox,
         event_sequence: state.event_sequence,
-        reserved: [0; 2],
+        instance_id: hypervisor::vmm::instance_identity().0,
+        attempt_epoch: hypervisor::vmm::instance_identity().1,
     };
     ioctl::write_pod(output, &response)
 }
@@ -962,7 +1016,8 @@ fn execute_get_caps(request: ioctl::RequestHeader, output: &mut [u8]) -> Result<
         reserved2: 0,
         max_backing_pages: hypervisor::ept::MAX_BACKING_PAGES as u32,
         reserved3: 0,
-        reserved: [0; 2],
+        instance_id: hypervisor::vmm::instance_identity().0,
+        attempt_epoch: hypervisor::vmm::instance_identity().1,
     };
     ioctl::write_pod(output, &response)
 }
