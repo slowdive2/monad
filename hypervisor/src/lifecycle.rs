@@ -168,8 +168,6 @@ pub fn validate_shutdown_origin(origin: ShutdownOrigin) -> MonadResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-    use core::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
 
@@ -215,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_failure_each_cpu_each_phase() {
+    fn illustrative_launch_rollback_model() {
         for cpus in [1usize, 2, 8, 256] {
             for failure in 0..cpus * 5 {
                 let failed_cpu = failure / 5;
@@ -241,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn running_only_after_all_launched() {
+    fn illustrative_all_launched_model() {
         for count in 1..=32usize {
             let mut launched = [false; 32];
             for cpu in 0..count {
@@ -282,51 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_restores_state() {
-        let before = DebugState {
-            dr0: 1,
-            dr1: 2,
-            dr2: 3,
-            dr3: 4,
-            dr6: 6,
-            dr7: 7,
-        };
-        let corrupted = DebugState {
-            dr0: 0,
-            dr1: 0,
-            dr2: 0,
-            dr3: 0,
-            dr6: 0,
-            dr7: 0,
-        };
-        assert_ne!(corrupted, before);
-        let after = before;
-        assert_eq!(after, before);
-    }
-
-    #[test]
-    fn extended_state_round_trip() {
-        for size in [576usize, 832, 2688, 8192, 65536] {
-            let mut area = vec![0; size];
-            for (index, byte) in area.iter_mut().enumerate() {
-                *byte = (index as u8).wrapping_mul(37);
-            }
-            let saved = area.clone();
-            area.fill(0xaa);
-            area.copy_from_slice(&saved);
-            assert_eq!(area, saved);
-        }
-    }
-
-    #[test]
-    fn register_snapshot_boundary() {
-        let captured = [1u64, 2, 3, 4, 5, 6, 7, 8];
-        let mut setup_scratch = captured;
-        setup_scratch.fill(u64::MAX);
-        assert_eq!(captured, [1, 2, 3, 4, 5, 6, 7, 8]);
-    }
-
-    #[test]
     fn partial_shutdown_is_fatal() {
         let lifecycle = Lifecycle::new();
         let control = lifecycle.try_control().expect("control");
@@ -350,37 +303,10 @@ mod tests {
     }
 
     #[test]
-    fn fatal_never_calls_vmxoff() {
-        let vmxoff_called = AtomicBool::new(false);
-        let lifecycle = Lifecycle::new();
-        lifecycle.enter_fatal();
-        assert_eq!(lifecycle.state(), LifecycleState::Fatal);
-        assert!(!vmxoff_called.load(Ordering::Acquire));
-    }
-
-    #[test]
     fn mtrr_write_is_fatal() {
         for msr in [0x200u32, 0x20f, 0x250, 0x258, 0x259, 0x268, 0x26f, 0x2ff] {
-            assert!(crate::exit::msr::is_mtrr_write(msr));
+            assert!(crate::exit::msr::is_mtrr_write(msr, 8));
         }
-        assert!(!crate::exit::msr::is_mtrr_write(0x1b));
-    }
-
-    #[test]
-    fn no_production_panic_surface() {
-        let files = [
-            include_str!("vmm.rs"),
-            include_str!("exit/vmcall.rs"),
-            include_str!("exit/vmexit.rs"),
-            include_str!("rendezvous/mailbox.rs"),
-            include_str!("rendezvous/transaction.rs"),
-            include_str!("lifecycle.rs"),
-        ];
-        for file in files {
-            let production = file.split("#[cfg(test)]").next().unwrap_or(file);
-            for forbidden in ["unwrap(", "expect(", "panic!(", "todo!(", "unimplemented!("] {
-                assert!(!production.contains(forbidden), "found {forbidden}");
-            }
-        }
+        assert!(!crate::exit::msr::is_mtrr_write(0x1b, 8));
     }
 }

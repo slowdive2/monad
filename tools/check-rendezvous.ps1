@@ -28,7 +28,8 @@ $requiredTests = @(
     'shared_base_eptp',
     'transaction_success',
     'failure_each_switch_step_rolls_back',
-    'rollback_failure_is_fatal',
+    'recovery_failure_cannot_cross_the_production_resume_boundary',
+    'mailbox_commit_failure_is_terminal_after_hardware_commit',
     'barrier_timeout_is_fatal',
     'nontargets_remain_at_barrier',
     'no_active_table_write',
@@ -68,13 +69,14 @@ if ($vmcallText -match '(?i)magic|service selector|guest.*pointer.*use') {
 }
 $callbackText = [regex]::Match(
     $vmmText,
-    '(?s)unsafe extern "C" fn activate_cpu.*?\n}\n\n/// installs'
+    '(?ms)^unsafe extern "C" fn activate_cpu\b.*?^}'
 ).Value
+if (-not $callbackText) { throw 'activation callback extraction was empty' }
 if ($callbackText -match '\b(?:Vec|Box|try_reserve|push)\b') {
     throw 'rendezvous callback contains dynamic transaction growth'
 }
 
 Write-Output 'mailbox and transaction surface: pass'
 Write-Output 'release/acquire ordering surface: pass'
-Write-Output 'view switch and rollback ordering: pass'
+Write-Output 'view switch and rollback source shape: pass'
 Write-Output 'active hierarchy immutability: pass'

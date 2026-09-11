@@ -5,13 +5,14 @@ use hypervisor::lifecycle::LifecycleState;
 
 use crate::session::ControllerSession;
 
-pub const ABI_VERSION: u16 = 2;
+pub const ABI_VERSION: u16 = 3;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const FILE_DEVICE_UNKNOWN: u32 = 0x22;
 pub const METHOD_BUFFERED: u32 = 0;
 pub const FILE_READ_ACCESS: u32 = 1;
 pub const FILE_WRITE_ACCESS: u32 = 2;
 pub const KNOWN_REQUEST_FLAGS: u32 = 0;
+pub const EXPERIMENT_UNRESTRICTED_EDITS: u32 = 1;
 pub const ALLOCATION_FLAG_IMMUTABLE: u32 = 1;
 pub const KNOWN_ALLOCATION_FLAGS: u32 = ALLOCATION_FLAG_IMMUTABLE;
 pub const EDIT_SET_PERMISSIONS: u32 = 1;
@@ -34,6 +35,7 @@ pub const IOCTL_START_VMM: u32 = ctl_code(0x801, FILE_READ_ACCESS | FILE_WRITE_A
 pub const IOCTL_STOP_VMM: u32 = ctl_code(0x802, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
 pub const IOCTL_ALLOCATE_BACKING: u32 = ctl_code(0x810, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
 pub const IOCTL_WRITE_BACKING: u32 = ctl_code(0x811, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
+pub const IOCTL_REGISTER_TARGET: u32 = ctl_code(0x813, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
 pub const IOCTL_FREE_BACKING: u32 = ctl_code(0x812, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
 pub const IOCTL_CREATE_DRAFT: u32 = ctl_code(0x820, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
 pub const IOCTL_APPLY_EDIT_BATCH: u32 = ctl_code(0x821, FILE_READ_ACCESS | FILE_WRITE_ACCESS);
@@ -191,7 +193,22 @@ macro_rules! response_only {
 }
 
 header_only!(GetCapsRequest, EmptyResponse);
-header_only!(StopVmmRequest, StopVmmResponse);
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StopVmmRequest {
+    pub header: RequestHeader,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StartVmmResponse {
+    pub header: ResponseHeader,
+    pub instance_id: u64,
+    /// Zero means this request did not begin a new transition.
+    pub attempt_epoch: u64,
+}
+pub type StopVmmResponse = StartVmmResponse;
+pub type ActivateViewResponse = StartVmmResponse;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -213,7 +230,8 @@ pub struct GetCapsResponse {
     pub reserved2: u16,
     pub max_backing_pages: u32,
     pub reserved3: u32,
-    pub reserved: [u64; 2],
+    pub instance_id: u64,
+    pub attempt_epoch: u64,
 }
 
 #[repr(C)]
@@ -223,7 +241,7 @@ pub struct StartVmmRequest {
     pub aperture_limit: u64,
     pub rendezvous_timeout_tsc: u64,
     pub device_range_count: u32,
-    pub reserved0: u32,
+    pub experiment_flags: u32,
     pub reserved1: u64,
 }
 
@@ -234,8 +252,6 @@ pub struct DevicePhysicalRangeWire {
     pub length: u64,
     pub reserved: u64,
 }
-
-response_only!(StartVmmResponse);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -251,6 +267,22 @@ pub struct AllocateBackingRequest {
 pub struct AllocateBackingResponse {
     pub header: ResponseHeader,
     pub backing: BackingIdWire,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegisterTargetRequest {
+    pub header: RequestHeader,
+    pub backing: BackingIdWire,
+    pub page_index: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegisterTargetResponse {
+    pub header: ResponseHeader,
+    pub gpa: u64,
 }
 
 #[repr(C)]
@@ -407,8 +439,6 @@ pub struct ActivateViewRequest {
     pub reserved: u32,
 }
 
-response_only!(ActivateViewResponse);
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadEventsRequest {
@@ -451,7 +481,8 @@ pub struct GetVcpuStateResponse {
     pub last_fatal: u32,
     pub last_mailbox: u32,
     pub event_sequence: u64,
-    pub reserved: [u64; 2],
+    pub instance_id: u64,
+    pub attempt_epoch: u64,
 }
 
 const _: [(); 24] = [(); size_of::<RequestHeader>()];
@@ -477,11 +508,13 @@ abi_layout!(EmptyResponse, 48);
 abi_layout!(GetCapsResponse, 112);
 abi_layout!(StartVmmRequest, 56);
 abi_layout!(DevicePhysicalRangeWire, 24);
-abi_layout!(StartVmmResponse, 48);
+abi_layout!(StartVmmResponse, 64);
 abi_layout!(StopVmmRequest, 24);
-abi_layout!(StopVmmResponse, 48);
+abi_layout!(StopVmmResponse, 64);
 abi_layout!(AllocateBackingRequest, 40);
 abi_layout!(AllocateBackingResponse, 72);
+abi_layout!(RegisterTargetRequest, 56);
+abi_layout!(RegisterTargetResponse, 56);
 abi_layout!(WriteBackingRequest, 64);
 abi_layout!(WriteBackingResponse, 48);
 abi_layout!(FreeBackingRequest, 48);
@@ -501,7 +534,7 @@ abi_layout!(ListViewsRequest, 32);
 abi_layout!(ViewRecordWire, 112);
 abi_layout!(ListViewsResponse, 56);
 abi_layout!(ActivateViewRequest, 48);
-abi_layout!(ActivateViewResponse, 48);
+abi_layout!(ActivateViewResponse, 64);
 abi_layout!(ReadEventsRequest, 40);
 abi_layout!(ReadEventsResponse, 72);
 abi_layout!(GetVcpuStateRequest, 32);
@@ -518,7 +551,7 @@ pub struct OperationDescriptor {
     pub trailing_element_size: usize,
 }
 
-pub const OPERATIONS: [OperationDescriptor; 15] = [
+pub const OPERATIONS: [OperationDescriptor; 16] = [
     op::<GetCapsRequest, GetCapsResponse>(IOCTL_GET_CAPS, false, true, None, 0),
     op::<StartVmmRequest, StartVmmResponse>(
         IOCTL_START_VMM,
@@ -541,6 +574,13 @@ pub const OPERATIONS: [OperationDescriptor; 15] = [
         false,
         Some(core::mem::offset_of!(WriteBackingRequest, data_length)),
         1,
+    ),
+    op::<RegisterTargetRequest, RegisterTargetResponse>(
+        IOCTL_REGISTER_TARGET,
+        true,
+        false,
+        None,
+        0,
     ),
     op::<FreeBackingRequest, FreeBackingResponse>(IOCTL_FREE_BACKING, true, false, None, 0),
     op::<CreateDraftRequest, CreateDraftResponse>(IOCTL_CREATE_DRAFT, true, false, None, 0),
@@ -714,7 +754,7 @@ fn validate_reserved(code: u32, input: &[u8]) -> Result<(), MonadError> {
     let nonzero = match code {
         IOCTL_START_VMM => {
             let value = read_pod::<StartVmmRequest>(input, 0)?;
-            value.reserved0 != 0
+            value.experiment_flags & !EXPERIMENT_UNRESTRICTED_EDITS != 0
                 || value.reserved1 != 0
                 || device_ranges_have_reserved(input, value.device_range_count)?
         }
@@ -724,6 +764,10 @@ fn validate_reserved(code: u32, input: &[u8]) -> Result<(), MonadError> {
         }
         IOCTL_WRITE_BACKING => {
             let value = read_pod::<WriteBackingRequest>(input, 0)?;
+            value.backing.reserved != 0 || value.reserved != 0
+        }
+        IOCTL_REGISTER_TARGET => {
+            let value = read_pod::<RegisterTargetRequest>(input, 0)?;
             value.backing.reserved != 0 || value.reserved != 0
         }
         IOCTL_FREE_BACKING => read_pod::<FreeBackingRequest>(input, 0)?.backing.reserved != 0,
@@ -866,16 +910,18 @@ pub fn lifecycle_allows(code: u32, state: LifecycleState) -> bool {
         IOCTL_GET_CAPS => true,
         IOCTL_START_VMM => state == LifecycleState::Absent,
         IOCTL_STOP_VMM => state == LifecycleState::Running,
-        IOCTL_ALLOCATE_BACKING
+        IOCTL_REGISTER_TARGET
+        | IOCTL_ALLOCATE_BACKING
         | IOCTL_WRITE_BACKING
         | IOCTL_FREE_BACKING
         | IOCTL_CREATE_DRAFT
         | IOCTL_APPLY_EDIT_BATCH
         | IOCTL_DISCARD_DRAFT
         | IOCTL_PUBLISH_VIEW => state == LifecycleState::Running,
-        IOCTL_QUERY_MAPPING | IOCTL_LIST_VIEWS | IOCTL_READ_EVENTS | IOCTL_GET_VCPU_STATE => {
-            state == LifecycleState::Running
+        IOCTL_READ_EVENTS | IOCTL_GET_VCPU_STATE => {
+            matches!(state, LifecycleState::Running | LifecycleState::Absent)
         }
+        IOCTL_QUERY_MAPPING | IOCTL_LIST_VIEWS => state == LifecycleState::Running,
         IOCTL_ACTIVATE_VIEW => state == LifecycleState::Running,
         _ => false,
     }
@@ -972,7 +1018,11 @@ mod tests {
         assert_eq!(offset_of!(QueryMappingResponse, source_backing), 56);
         assert_eq!(size_of::<ViewRecordWire>(), 112);
         assert_eq!(offset_of!(ViewRecordWire, active_cpu_set), 80);
-        assert_eq!(OPERATIONS.len(), 15);
+        assert_eq!(OPERATIONS.len(), 16);
+        assert_eq!(size_of::<StartVmmResponse>(), 64);
+        assert_eq!(size_of::<RegisterTargetRequest>(), 56);
+        assert_eq!(size_of::<RegisterTargetResponse>(), 56);
+        assert_eq!(IOCTL_REGISTER_TARGET, ctl_code(0x813, 3));
         assert_eq!(IOCTL_GET_CAPS, ctl_code(0x800, FILE_READ_ACCESS));
         assert_eq!(IOCTL_START_VMM, ctl_code(0x801, 3));
         assert_eq!(IOCTL_STOP_VMM, ctl_code(0x802, 3));
@@ -1067,7 +1117,7 @@ mod tests {
             aperture_limit: 0,
             rendezvous_timeout_tsc: 1,
             device_range_count: 0,
-            reserved0: 1,
+            experiment_flags: 2,
             reserved1: 0,
         };
         assert_eq!(
@@ -1086,7 +1136,7 @@ mod tests {
             aperture_limit: 1 << 39,
             rendezvous_timeout_tsc: 1,
             device_range_count: 1,
-            reserved0: 0,
+            experiment_flags: 0,
             reserved1: 0,
         };
         let mut start_bytes = bytes(&start);
@@ -1174,7 +1224,54 @@ mod tests {
     }
 
     #[test]
-    fn no_pointer_or_hpa_exposure() {
+    fn stopped_evidence_and_target_admission_contract() {
+        assert!(lifecycle_allows(IOCTL_READ_EVENTS, LifecycleState::Absent));
+        assert!(lifecycle_allows(
+            IOCTL_GET_VCPU_STATE,
+            LifecycleState::Absent
+        ));
+        assert!(!lifecycle_allows(
+            IOCTL_REGISTER_TARGET,
+            LifecycleState::Absent
+        ));
+        assert!(!lifecycle_allows(
+            IOCTL_APPLY_EDIT_BATCH,
+            LifecycleState::Absent
+        ));
+        assert!(lifecycle_allows(
+            IOCTL_REGISTER_TARGET,
+            LifecycleState::Running
+        ));
+        let mut request = RegisterTargetRequest {
+            header: request_header(size_of::<RegisterTargetRequest>(), 7),
+            backing: BackingIdWire {
+                slot: 0,
+                reserved: 0,
+                generation: 1,
+                session_nonce: 9,
+            },
+            page_index: 0,
+            reserved: 0,
+        };
+        assert!(validate_request(
+            IOCTL_REGISTER_TARGET,
+            &bytes(&request),
+            size_of::<RegisterTargetResponse>(),
+            7
+        )
+        .is_ok());
+        request.reserved = 1;
+        assert!(validate_request(
+            IOCTL_REGISTER_TARGET,
+            &bytes(&request),
+            size_of::<RegisterTargetResponse>(),
+            7
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn no_pointer_or_arbitrary_hpa_input() {
         let names = include_str!("ioctl.rs");
         let schema = names.split("#[cfg(test)]").next().unwrap_or("");
         for forbidden in [

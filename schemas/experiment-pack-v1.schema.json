@@ -41,6 +41,7 @@
       "additionalProperties": false,
       "required": ["aperture_limit", "rendezvous_timeout_tsc", "device_ranges"],
       "properties": {
+        "unrestricted_edits": { "type": "boolean", "default": false },
         "aperture_limit": {
           "type": "integer",
           "minimum": 0,
@@ -58,6 +59,7 @@
     },
     "views": {
       "type": "array",
+      "maxItems": 7,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -67,6 +69,7 @@
           "source": { "$ref": "#/$defs/id" },
           "edits": {
             "type": "array",
+            "maxItems": 64,
             "minItems": 1,
             "items": { "$ref": "#/$defs/edit" }
           }
@@ -203,11 +206,11 @@
           "properties": {
             "action": { "const": "map_backing4k" },
             "gpa": { "type": "integer", "minimum": 0 },
-            "length": { "type": "integer", "minimum": 1 },
+            "length": { "const": 4096 },
             "artifact": { "type": "string", "minLength": 1 },
             "artifact_sha256": { "$ref": "#/$defs/sha256" },
             "permissions": { "type": "integer", "minimum": 0, "maximum": 7 },
-            "memory_type": { "enum": [0, 1, 4, 5, 6] }
+            "memory_type": { "const": 6 }
           }
         }
       ]

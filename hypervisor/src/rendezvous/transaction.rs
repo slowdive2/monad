@@ -1,6 +1,7 @@
 extern crate alloc;
 
-use alloc::{boxed::Box, vec::Vec};
+#[cfg(test)]
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::ept::ViewId;
@@ -30,13 +31,29 @@ pub trait ViewSwitchBackend {
     fn run(&mut self, cpu: u16, step: SwitchStep, eptp: u64) -> MonadResult<()>;
 }
 
+/// An error is resumable only when recovery is established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchFailure {
+    pub forward: MonadError,
+    pub recovery: Option<MonadError>,
+}
+
+impl From<MonadError> for SwitchFailure {
+    fn from(forward: MonadError) -> Self {
+        Self {
+            forward,
+            recovery: None,
+        }
+    }
+}
+
 pub fn switch_view<B: ViewSwitchBackend>(
     cpu: u16,
     active: &mut ActiveViewState,
     request: MailboxRequest,
     mailbox: &InternalMailbox,
     backend: &mut B,
-) -> MonadResult<()> {
+) -> Result<(), SwitchFailure> {
     if active.eptp != request.expected_old_eptp {
         mailbox.fail(MailboxStatus::OldViewMismatch);
         return Err(MonadError::new(
@@ -44,7 +61,8 @@ pub fn switch_view<B: ViewSwitchBackend>(
             ErrorCode::WrongObjectState,
             active.eptp,
         )
-        .on_cpu(cpu));
+        .on_cpu(cpu)
+        .into());
     }
     let old = *active;
     let steps = [
@@ -55,19 +73,28 @@ pub fn switch_view<B: ViewSwitchBackend>(
     for (step, eptp) in steps {
         if let Err(error) = backend.run(cpu, step, eptp) {
             mailbox.fail(MailboxStatus::SwitchFailed);
-            restore_after_failure(cpu, old.eptp, request.target_eptp, backend)?;
-            return Err(error.on_cpu(cpu));
+            let recovery = restore_after_failure(cpu, old.eptp, request.target_eptp, backend)
+                .err()
+                .map(|error| error.on_cpu(cpu));
+            return Err(SwitchFailure {
+                forward: error.on_cpu(cpu),
+                recovery,
+            });
         }
     }
     active.id = request.target_view;
     active.eptp = request.target_eptp;
     mailbox.complete().map_err(|status| {
-        MonadError::new(
+        let error = MonadError::new(
             ErrorPhase::Activation,
             ErrorCode::WrongObjectState,
             status as u64,
         )
-        .on_cpu(cpu)
+        .on_cpu(cpu);
+        SwitchFailure {
+            forward: error,
+            recovery: Some(error),
+        }
     })
 }
 
@@ -139,7 +166,7 @@ pub struct RendezvousTransaction {
     pub failed: AtomicBool,
     pub fatal: AtomicBool,
     pub release: AtomicBool,
-    pub per_cpu: Box<[RendezvousCpuResult]>,
+    pub per_cpu: [RendezvousCpuResult; MAX_LOGICAL_CPUS],
     deadline_tsc: u64,
 }
 
@@ -182,17 +209,6 @@ impl RendezvousTransaction {
                 0,
             ));
         }
-        let mut results = Vec::new();
-        results
-            .try_reserve_exact(usize::from(participant_count))
-            .map_err(|_| {
-                MonadError::new(
-                    ErrorPhase::Rendezvous,
-                    ErrorCode::AllocationFailure,
-                    u64::from(participant_count),
-                )
-            })?;
-        results.extend((0..participant_count).map(|_| RendezvousCpuResult::new()));
         Ok(Self {
             epoch,
             target_mask,
@@ -203,7 +219,7 @@ impl RendezvousTransaction {
             failed: AtomicBool::new(false),
             fatal: AtomicBool::new(false),
             release: AtomicBool::new(false),
-            per_cpu: results.into_boxed_slice(),
+            per_cpu: core::array::from_fn(|_| RendezvousCpuResult::new()),
             deadline_tsc,
         })
     }
@@ -434,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_failure_is_fatal() {
+    fn illustrative_rollback_failure_model() {
         let transaction = RendezvousTransaction::new(1, 2, &[0, 1], 100).expect("tx");
         let mut active = view(1, 0x2000);
         let mut backend = ModelBackend {
@@ -683,5 +699,104 @@ mod tests {
                 "no terminal state for failure {failed_cpu:?}"
             );
         }
+    }
+    #[test]
+    fn recovery_failure_cannot_cross_the_production_resume_boundary() {
+        use crate::exit::{
+            disposition::{ExitDisposition, FatalReason},
+            vmcall::switch_disposition,
+        };
+        struct Hardware {
+            eptp: u64,
+            fail_forward: SwitchStep,
+            fail_recovery: Option<SwitchStep>,
+            invalidated: Vec<u64>,
+        }
+        impl ViewSwitchBackend for Hardware {
+            fn run(&mut self, cpu: u16, step: SwitchStep, eptp: u64) -> MonadResult<()> {
+                if step == self.fail_forward || Some(step) == self.fail_recovery {
+                    return Err(MonadError::new(
+                        ErrorPhase::Activation,
+                        ErrorCode::InveptFailure,
+                        step as u64,
+                    )
+                    .on_cpu(cpu));
+                }
+                match step {
+                    SwitchStep::WriteTarget | SwitchStep::RestoreOld => self.eptp = eptp,
+                    _ => self.invalidated.push(eptp),
+                }
+                Ok(())
+            }
+        }
+        for forward in [
+            SwitchStep::WriteTarget,
+            SwitchStep::InvalidateOld,
+            SwitchStep::InvalidateTarget,
+        ] {
+            for recovery in [
+                None,
+                Some(SwitchStep::RestoreOld),
+                Some(SwitchStep::InvalidateFailedTarget),
+                Some(SwitchStep::InvalidateRestoredOld),
+            ] {
+                let old = view(0, 0x101e);
+                let target = view(1, 0x201e);
+                let mut active = old;
+                let mailbox = InternalMailbox::new();
+                let mut hardware = Hardware {
+                    eptp: old.eptp,
+                    fail_forward: forward,
+                    fail_recovery: recovery,
+                    invalidated: Vec::new(),
+                };
+                let result = switch_view(
+                    0,
+                    &mut active,
+                    request(1, old, target),
+                    &mailbox,
+                    &mut hardware,
+                );
+                let failure = result.expect_err("injected failure");
+                assert_eq!(failure.forward.detail, forward as u64);
+                assert_eq!(
+                    failure.recovery.map(|error| error.detail),
+                    recovery.map(|step| step as u64)
+                );
+                assert_eq!(active, old);
+                let disposition = switch_disposition(RendezvousOperation::SwitchView, result);
+                if recovery.is_some() {
+                    assert_eq!(
+                        disposition,
+                        ExitDisposition::Fatal(FatalReason::RendezvousRollbackFailure)
+                    );
+                    if recovery == Some(SwitchStep::RestoreOld)
+                        && forward != SwitchStep::WriteTarget
+                    {
+                        assert_eq!(hardware.eptp, target.eptp);
+                    }
+                } else {
+                    assert_eq!(hardware.eptp, old.eptp);
+                    assert!(hardware.invalidated.ends_with(&[target.eptp, old.eptp]));
+                    assert_eq!(disposition, ExitDisposition::ResumeAndAdvance);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mailbox_commit_failure_is_terminal_after_hardware_commit() {
+        let old = view(0, 0x101e);
+        let target = view(1, 0x201e);
+        let mut active = old;
+        let result = switch_view(
+            0,
+            &mut active,
+            request(1, old, target),
+            &InternalMailbox::new(),
+            &mut ModelBackend::default(),
+        );
+        assert_eq!(active, target);
+        assert!(result.expect_err("unarmed mailbox").recovery.is_some());
     }
 }

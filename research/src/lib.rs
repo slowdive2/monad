@@ -11,6 +11,9 @@ pub const EXPERIMENT_PACK_SCHEMA_VERSION: u32 = 1;
 pub const EVIDENCE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const PAGE_SIZE: u64 = 0x1000;
 const DEFAULT_APERTURE_LIMIT: u64 = 1 << 39;
+pub const SUBSTRATE_ABI_VERSION: u16 = 3;
+const MAX_PUBLISHED_VIEWS: usize = 8;
+const MAX_BATCH_EDITS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +45,8 @@ pub struct MachineSelector {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchPlan {
+    #[serde(default)]
+    pub unrestricted_edits: bool,
     /// zero selects monad's documented default limit.
     pub aperture_limit: u64,
     pub rendezvous_timeout_tsc: u64,
@@ -122,6 +127,8 @@ pub struct StopConditions {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ExecutionPlan {
+    pub substrate_abi_version: u16,
+    pub status: &'static str,
     pub schema_version: u32,
     pub experiment_id: String,
     pub pack_sha256: String,
@@ -219,7 +226,13 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn validate_range(issues: &mut Vec<ValidationIssue>, path: &str, start: u64, length: u64) {
+fn validate_range(
+    issues: &mut Vec<ValidationIssue>,
+    path: &str,
+    start: u64,
+    length: u64,
+    limit: u64,
+) {
     if start & (PAGE_SIZE - 1) != 0 {
         issue(issues, format!("{path}.gpa"), "must be 4 KiB aligned");
     }
@@ -230,8 +243,14 @@ fn validate_range(issues: &mut Vec<ValidationIssue>, path: &str, start: u64, len
             "must be a nonzero multiple of 4 KiB",
         );
     }
-    if start.checked_add(length).is_none() {
-        issue(issues, path, "range overflows u64");
+    match start.checked_add(length) {
+        None => issue(issues, path, "range overflows u64"),
+        Some(end) if end > limit.min(1 << 48) => issue(
+            issues,
+            path,
+            "range exceeds the configured or architectural aperture",
+        ),
+        _ => {}
     }
 }
 
@@ -343,6 +362,13 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
         }
     }
 
+    if pack.views.len() >= MAX_PUBLISHED_VIEWS {
+        issue(
+            &mut issues,
+            "views",
+            "at most seven alternate views fit in one VMM instance",
+        );
+    }
     let mut names = HashSet::new();
     names.insert("base".to_owned());
     for (view_index, view) in pack.views.iter().enumerate() {
@@ -353,7 +379,7 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                 format!("{view_path}.name"),
                 "must be a unique identifier other than 'base'",
             );
-        } else if !names.insert(view.name.clone()) {
+        } else if names.contains(&view.name) {
             issue(
                 &mut issues,
                 format!("{view_path}.name"),
@@ -365,6 +391,14 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                 &mut issues,
                 format!("{view_path}.source"),
                 "must name base or a previously defined view",
+            );
+        }
+        names.insert(view.name.clone());
+        if view.edits.len() > MAX_BATCH_EDITS {
+            issue(
+                &mut issues,
+                format!("{view_path}.edits"),
+                "this planner supports one batch of at most 64 edits per view",
             );
         }
         if view.edits.is_empty() {
@@ -382,7 +416,7 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                     length,
                     permissions,
                 } => {
-                    validate_range(&mut issues, &edit_path, *gpa, *length);
+                    validate_range(&mut issues, &edit_path, *gpa, *length, effective_limit);
                     validate_permissions(
                         &mut issues,
                         &format!("{edit_path}.permissions"),
@@ -390,7 +424,7 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                     );
                 }
                 ViewEdit::RestoreFromBase { gpa, length } => {
-                    validate_range(&mut issues, &edit_path, *gpa, *length);
+                    validate_range(&mut issues, &edit_path, *gpa, *length, effective_limit);
                 }
                 ViewEdit::MapBacking4k {
                     gpa,
@@ -400,12 +434,19 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                     permissions,
                     memory_type,
                 } => {
-                    validate_range(&mut issues, &edit_path, *gpa, *length);
+                    validate_range(&mut issues, &edit_path, *gpa, *length, effective_limit);
                     validate_permissions(
                         &mut issues,
                         &format!("{edit_path}.permissions"),
                         *permissions,
                     );
+                    if *length != PAGE_SIZE {
+                        issue(
+                            &mut issues,
+                            format!("{edit_path}.length"),
+                            "map_backing4k is exactly one 4 KiB edit",
+                        );
+                    }
                     if artifact.trim().is_empty() {
                         issue(
                             &mut issues,
@@ -420,11 +461,11 @@ pub fn validate(pack: &ExperimentPack) -> Result<(), ResearchError> {
                             "must be 64 lowercase hexadecimal characters",
                         );
                     }
-                    if !matches!(*memory_type, 0 | 1 | 4 | 5 | 6) {
+                    if *memory_type != 6 {
                         issue(
                             &mut issues,
                             format!("{edit_path}.memory_type"),
-                            "must be an architectural EPT memory type: 0, 1, 4, 5, or 6",
+                            "cached backing remaps require memory type 6 (write-back)",
                         );
                     }
                 }
@@ -551,6 +592,8 @@ pub fn compile_plan(pack: &ExperimentPack) -> Result<ExecutionPlan, ResearchErro
             }])
         })?;
     Ok(ExecutionPlan {
+        substrate_abi_version: SUBSTRATE_ABI_VERSION,
+        status: "static-plan-requires-machine-and-target-preflight",
         schema_version: EXPERIMENT_PACK_SCHEMA_VERSION,
         experiment_id: pack.experiment_id.clone(),
         pack_sha256: sha256_hex(&canonical),
@@ -560,6 +603,80 @@ pub fn compile_plan(pack: &ExperimentPack) -> Result<ExecutionPlan, ResearchErro
         view_build_order: pack.views.iter().map(|view| view.name.clone()).collect(),
         activation_order: pack.schedule.iter().map(|step| step.view.clone()).collect(),
     })
+}
+
+const SOURCE_FILES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo/config.toml",
+    "hypervisor/Cargo.toml",
+    "driver/Cargo.toml",
+    "driver/build.rs",
+    "research/Cargo.toml",
+    "monadctl/Cargo.toml",
+];
+const SOURCE_DIRS: &[&str] = &[
+    "hypervisor/src",
+    "driver/src",
+    "research/src",
+    "monadctl/src",
+    "tools",
+    "schemas",
+];
+
+/// Hash current source bytes, including untracked additions; examples and outputs
+/// are excluded to avoid a pack's source_sha256 becoming self-referential.
+pub fn source_digest(root: &Path) -> Result<String, ResearchError> {
+    fn collect(path: &Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "source symlinks are not supported",
+                ));
+            }
+            if kind.is_dir() {
+                collect(&entry.path(), files)?;
+            } else if kind.is_file() {
+                files.push(entry.path());
+            }
+        }
+        Ok(())
+    }
+    let mut files: Vec<_> = SOURCE_FILES.iter().map(|name| root.join(name)).collect();
+    for directory in SOURCE_DIRS {
+        collect(&root.join(directory), &mut files)?;
+    }
+    let mut entries = Vec::new();
+    for file in files {
+        let relative = file.strip_prefix(root).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source path escaped repository",
+            )
+        })?;
+        let name = relative
+            .to_str()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path is not UTF-8")
+            })?
+            .replace('\\', "/");
+        entries.push((name, file));
+    }
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut digest = Sha256::new();
+    digest.update(b"monad-source-v1\0");
+    for (name, file) in entries {
+        let bytes = fs::read(file)?;
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 pub fn prepare_evidence_bundle(
@@ -591,6 +708,9 @@ pub fn prepare_evidence_bundle(
         total_activation_steps: plan.total_activation_steps,
         required_records: vec![
             "capabilities.json".to_owned(),
+            "loaded-driver-identity.json".to_owned(),
+            "target-bindings.json".to_owned(),
+            "stop-receipt.json".to_owned(),
             "activation-history.jsonl".to_owned(),
             "events.bin".to_owned(),
             "event-loss.json".to_owned(),
@@ -633,6 +753,7 @@ mod tests {
                 microcode: "test-microcode".to_owned(),
             },
             launch: LaunchPlan {
+                unrestricted_edits: false,
                 aperture_limit: DEFAULT_APERTURE_LIMIT,
                 rendezvous_timeout_tsc: 100,
                 device_ranges: vec![DeviceRange {
@@ -745,5 +866,75 @@ mod tests {
         assert!(output.join("experiment-pack.canonical.json").is_file());
         assert!(output.join("evidence-manifest.json").is_file());
         fs::remove_dir_all(&output).expect("remove test directory");
+    }
+    #[test]
+    fn static_plan_rejects_the_audit_counterexamples() {
+        let mut invalid = pack();
+        invalid.views[0].source = invalid.views[0].name.clone();
+        assert!(compile_plan(&invalid).is_err());
+        invalid = pack();
+        if let ViewEdit::SetPermissions { gpa, .. } = &mut invalid.views[0].edits[0] {
+            *gpa = 1 << 48;
+        }
+        assert!(compile_plan(&invalid).is_err());
+        invalid = pack();
+        for i in 1..8 {
+            let mut view = invalid.views[0].clone();
+            view.name = format!("view-{i}");
+            invalid.views.push(view);
+        }
+        assert!(compile_plan(&invalid).is_err());
+        for memory_type in [0, 1, 4, 5, 7] {
+            invalid = pack();
+            invalid.views[0].edits[0] = ViewEdit::MapBacking4k {
+                gpa: 0x2000,
+                length: PAGE_SIZE,
+                artifact: "input.bin".to_owned(),
+                artifact_sha256: "1".repeat(64),
+                permissions: 7,
+                memory_type,
+            };
+            assert!(compile_plan(&invalid).is_err());
+        }
+        invalid = pack();
+        invalid.views[0].edits = vec![invalid.views[0].edits[0].clone(); 65];
+        assert!(compile_plan(&invalid).is_err());
+    }
+
+    #[test]
+    fn source_digest_covers_new_source_but_not_evidence_outputs() {
+        let root = std::env::temp_dir().join(format!(
+            "monad-source-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        for dir in SOURCE_DIRS {
+            fs::create_dir_all(root.join(dir)).expect("source directory");
+        }
+        for file in SOURCE_FILES {
+            fs::create_dir_all(root.join(file).parent().expect("parent"))
+                .expect("parent directory");
+            fs::write(root.join(file), b"fixture").expect("source");
+        }
+        let before = source_digest(&root).expect("digest");
+        fs::write(root.join("driver/src/new.rs"), b"new implementation").expect("untracked source");
+        let after = source_digest(&root).expect("digest");
+        assert_ne!(before, after);
+        fs::create_dir(root.join("target")).expect("output directory");
+        fs::write(root.join("target/result.json"), b"evidence").expect("output");
+        assert_eq!(after, source_digest(&root).expect("stable source"));
+        assert_eq!(
+            root.canonicalize().expect("fixture").parent(),
+            Some(
+                std::env::temp_dir()
+                    .canonicalize()
+                    .expect("temp root")
+                    .as_path()
+            )
+        );
+        fs::remove_dir_all(root).expect("remove owned temporary fixture");
     }
 }

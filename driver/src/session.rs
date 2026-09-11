@@ -67,8 +67,14 @@ impl ControllerSession {
         if nonce == 0 || self.nonce.load(Ordering::Acquire) != nonce {
             return Err(session_error(ErrorCode::WrongSession, nonce));
         }
+        Ok(self.close_owner())
+    }
+
+    /// The successful WDM file owner invokes this only at its final close.
+    /// Cleanup cannot release the nonce; Windows has already drained that file's I/O.
+    pub(crate) fn close_owner(&self) -> CloseDrain<'_> {
         self.closing.store(true, Ordering::Release);
-        Ok(CloseDrain { session: self })
+        CloseDrain { session: self }
     }
 
     #[cfg(test)]
@@ -128,6 +134,25 @@ fn session_error(code: ErrorCode, detail: u64) -> MonadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_quiesces_but_only_final_owner_close_releases() {
+        let session = ControllerSession::new();
+        session.acquire(7).expect("owner");
+        let request = session.begin(7, true).expect("inflight");
+        {
+            let cleanup = session.begin_close(7).expect("cleanup");
+            assert!(!cleanup.is_drained());
+        }
+        assert_eq!(session.active_nonce(), 7);
+        assert!(session.begin(7, false).is_err());
+        drop(request); // WDM final close follows this I/O completion.
+        let close = session.close_owner();
+        assert!(close.is_drained());
+        close.finish().expect("final release");
+        assert_eq!(session.active_nonce(), 0);
+        session.acquire(8).expect("new owner");
+    }
 
     #[test]
     fn session_exclusivity_and_close_race() {

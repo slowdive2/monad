@@ -27,7 +27,7 @@ try {
         'research/src/lib.rs',
         'monadctl/src/main.rs',
         'schemas/experiment-pack-v1.schema.json',
-        'experiments/permission-ab.example.json'
+        'examples/permission-ab.example.json'
     )) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "research-platform artifact is missing: $path"
@@ -35,13 +35,13 @@ try {
     }
 
     $abi = Get-Content -LiteralPath 'driver/src/ioctl.rs' -Raw
-    if ($abi -notmatch 'pub const ABI_VERSION: u16 = 2;' -or
+    if ($abi -notmatch 'pub const ABI_VERSION: u16 = 3;' -or
         $abi -notmatch 'DevicePhysicalRangeWire') {
-        throw 'research-platform launch inventory is not present in abi v2'
+        throw 'research-platform launch inventory is not present in abi v3'
     }
 
     $telemetry = Get-Content -LiteralPath 'hypervisor/src/telemetry/record.rs' -Raw
-    foreach ($field in @('schema_version', 'record_size', 'activation_epoch', 'run_id')) {
+    foreach ($field in @('schema_version', 'record_size', 'view_epoch', 'attempt_epoch', 'run_id')) {
         if ($telemetry -notmatch [regex]::Escape("pub $($field):")) {
             throw "research-platform telemetry provenance field is missing: $field"
         }
@@ -76,16 +76,25 @@ try {
     }
 
     Invoke-NativeChecked cargo @('test', '--locked', '-p', 'monad-research', '--lib')
-    Invoke-NativeChecked cargo @(
-        'run',
-        '--locked',
-        '-p',
-        'monadctl',
-        '--',
-        'validate',
-        'experiments/permission-ab.example.json'
-    )
-    Write-Output 'research-platform source gate: pass'
+    $fixture = 'examples/permission-ab.example.json'
+    Invoke-NativeChecked cargo @('run', '--locked', '-p', 'monadctl', '--', 'validate', $fixture)
+    Invoke-NativeChecked cargo @('run', '--locked', '-p', 'monadctl', '--', 'plan', $fixture, '--compact')
+    # Build a fresh preparation bundle with the current manifest identity. Keep it
+    # under target; it is preparation evidence, never an execution attestation.
+    $smoke = Join-Path $repositoryRoot ('target/research-smoke-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $smoke | Out-Null
+    $digestFile = Join-Path $smoke 'source.sha256'
+    Invoke-NativeChecked cargo @('run', '--locked', '-p', 'monadctl', '--', 'source-digest', '.', '--output', $digestFile)
+    $pack = Get-Content -LiteralPath $fixture -Raw | ConvertFrom-Json
+    $pack.source_sha256 = (Get-Content -LiteralPath $digestFile -Raw).Trim()
+    $packFile = Join-Path $smoke 'pack.json'
+    $json = $pack | ConvertTo-Json -Depth 30
+    [IO.File]::WriteAllText($packFile, $json, [Text.UTF8Encoding]::new($false))
+    $bundle = Join-Path $smoke 'bundle'
+    Invoke-NativeChecked cargo @('run', '--locked', '-p', 'monadctl', '--', 'prepare', $packFile, $bundle, '--source-digest', $digestFile)
+    $manifestFile = Join-Path $bundle 'evidence-manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestFile -PathType Leaf)) { throw 'prepare did not produce a manifest' }
+    Write-Output "research static validation and preparation workflow: pass ($smoke)"
 }
 finally {
     Pop-Location

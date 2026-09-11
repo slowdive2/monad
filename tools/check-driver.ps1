@@ -25,7 +25,7 @@ $required = @(
     'header_validation_matrix',
     'session_exclusivity_and_close_race',
     'operation_state_matrix',
-    'no_pointer_or_hpa_exposure',
+    'no_pointer_or_arbitrary_hpa_input',
     'fuzz_buffered_requests',
     'device_acl',
     'typed_adapter_conversion'
@@ -58,6 +58,7 @@ try {
         throw 'public ABI contains a non-buffered transfer method'
     }
     foreach ($adapter in @(
+        'execute_register_target',
         'execute_allocate_backing',
         'execute_write_backing',
         'execute_free_backing',

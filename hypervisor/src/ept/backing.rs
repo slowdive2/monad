@@ -56,6 +56,7 @@ struct BackingObject<A: EptPageAllocator> {
     state: BackingState,
     draft_refs: u32,
     published_refs: u32,
+    target_pinned: bool,
 }
 
 struct BackingSlot<A: EptPageAllocator> {
@@ -222,6 +223,7 @@ impl<A: EptPageAllocator + Clone> BackingRegistry<A> {
             },
             draft_refs: 0,
             published_refs: 0,
+            target_pinned: false,
         });
         Ok(id)
     }
@@ -441,13 +443,21 @@ impl<A: EptPageAllocator + Clone> BackingRegistry<A> {
         Ok(())
     }
 
+    pub(super) fn pin_target(&mut self, id: BackingId, nonce: u64) -> MonadResult<()> {
+        let object = self.slot_mut(id, nonce)?.object.as_mut().ok_or_else(|| {
+            MonadError::new(ErrorPhase::DraftEdit, ErrorCode::StaleHandle, id.generation)
+        })?;
+        object.target_pinned = true;
+        Ok(())
+    }
+
     pub(super) fn free(&mut self, id: BackingId, nonce: u64) -> MonadResult<()> {
         let index = id.slot as usize;
         let slot = self.slot_mut(id, nonce)?;
         let object = slot.object.as_ref().ok_or_else(|| {
             MonadError::new(ErrorPhase::DraftEdit, ErrorCode::StaleHandle, id.generation)
         })?;
-        if object.draft_refs != 0 || object.published_refs != 0 {
+        if object.target_pinned || object.draft_refs != 0 || object.published_refs != 0 {
             return Err(MonadError::new(
                 ErrorPhase::DraftEdit,
                 ErrorCode::BackingStillReferenced,

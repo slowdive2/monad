@@ -20,10 +20,7 @@ use x86::msr::{IA32_SYSENTER_CS, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP};
 
 use crate::arch::intel::{
     caps::{collect_capabilities, cpuid, IntelCapabilities, ValidatedPlatform, VmxonPermit},
-    state::{
-        read_debug_state, read_tsc, write_cr0, write_cr3, write_cr4, write_debug_state, write_msr,
-        Descriptors,
-    },
+    state::{read_tsc, write_cr3, write_cr4, write_dr7, write_msr, Descriptors, NativeReturnState},
     vmcs::{capture_registers, setup_vmcs, GuestRegs},
     vmx::{
         prepare_control_registers, rendezvous_vmcall, rendezvous_vmcall_bounds,
@@ -63,6 +60,7 @@ const DEFAULT_APERTURE_END: u64 = 1 << 39;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmmStartConfig {
     pub session_nonce: u64,
+    pub unrestricted_edits: bool,
     pub aperture_limit: u64,
     pub rendezvous_timeout_tsc: u64,
     pub device_ranges: Vec<PhysicalRange>,
@@ -72,6 +70,7 @@ impl VmmStartConfig {
     pub const fn new(session_nonce: u64) -> Self {
         Self {
             session_nonce,
+            unrestricted_edits: false,
             aperture_limit: 0,
             rendezvous_timeout_tsc: RENDEZVOUS_TSC_BUDGET,
             device_ranges: Vec::new(),
@@ -135,6 +134,10 @@ pub struct Vcpu {
     pub(crate) xsave_area: *mut u8,
     pub(crate) xsave_size: u32,
     pub(crate) xsave_mask: u64,
+    pub(crate) root_xcr0: u64,
+    pub(crate) guest_xcr0: u64,
+    pub(crate) root_cr3: u64,
+    pub(crate) mtrr_count: u8,
     pub(crate) regs: GuestRegs,
 
     pub(crate) active_view: ActiveViewState,
@@ -142,6 +145,7 @@ pub struct Vcpu {
     pub(crate) mailbox: InternalMailbox,
     pub(crate) rendezvous_epoch: AtomicU64,
     pub(crate) run_id: u64,
+    pub(crate) view_epoch: u64,
     pub(crate) published_views: *const PublishedViewDirectory,
     pub(crate) events: *mut EventRing,
     pub(crate) emergency_event: EventRecord,
@@ -152,15 +156,57 @@ pub struct Vcpu {
     pub(crate) capabilities: IntelCapabilities,
     vmxon_permit: VmxonPermit,
     pub(crate) original_controls: OriginalControlRegisters,
-    pub(crate) original_debug: crate::lifecycle::DebugState,
+    launch_error: Option<MonadError>,
     pub(crate) cpu: CpuId,
     // teardown waits for vmxoff before freeing this vcpu.
     active: AtomicBool,
 }
 
+// Page-sized pool allocations satisfy page alignment; the entire VCPU must fit.
+const _: () = assert!(size_of::<Vcpu>() <= PAGE_SIZE);
+const _: () = assert!(core::mem::align_of::<Vcpu>() <= PAGE_SIZE);
+
 impl Vcpu {
+    pub(crate) fn record_transition(
+        &self,
+        kind: crate::telemetry::EventKind,
+        status: u32,
+        detail: u32,
+    ) {
+        let event = EventRecord {
+            tsc: read_tsc(),
+            cpu_dense_index: self.cpu.dense_index,
+            cpu_group: self.cpu.group,
+            cpu_number: self.cpu.number,
+            kind: kind as u8,
+            view_slot: self.active_view.id.slot,
+            view_generation: self.active_view.id.generation,
+            status,
+            detail,
+            schema_version: crate::telemetry::EVENT_SCHEMA_VERSION,
+            record_size: crate::telemetry::EVENT_RECORD_BYTES as u16,
+            ..EventRecord::zeroed()
+        };
+        if let Some(ring) = unsafe { self.events.as_ref() } {
+            ring.record(self.stamp_event(event));
+        }
+    }
+
+    pub(crate) fn commit_view_epoch(&mut self) -> bool {
+        let Some(epoch) = self.view_epoch.checked_add(1) else {
+            return false;
+        };
+        self.view_epoch = epoch;
+        self.active_report.publish(self.active_view, epoch);
+        true
+    }
+
     pub(crate) fn stamp_event(&self, event: EventRecord) -> EventRecord {
-        event.with_provenance(self.run_id, self.rendezvous_epoch.load(Ordering::Acquire))
+        event.with_provenance(
+            self.run_id,
+            self.view_epoch,
+            self.rendezvous_epoch.load(Ordering::Acquire),
+        )
     }
 }
 
@@ -169,6 +215,7 @@ pub(crate) struct ActiveViewReport {
     slot: AtomicU16,
     generation: AtomicU64,
     eptp: AtomicU64,
+    epoch: AtomicU64,
 }
 
 impl ActiveViewReport {
@@ -178,19 +225,21 @@ impl ActiveViewReport {
             slot: AtomicU16::new(state.id.slot),
             generation: AtomicU64::new(state.id.generation),
             eptp: AtomicU64::new(state.eptp),
+            epoch: AtomicU64::new(0),
         }
     }
 
-    pub(crate) fn publish(&self, state: ActiveViewState) {
+    pub(crate) fn publish(&self, state: ActiveViewState, epoch: u64) {
         self.version.fetch_add(1, Ordering::AcqRel);
         self.slot.store(state.id.slot, Ordering::Relaxed);
         self.generation
             .store(state.id.generation, Ordering::Relaxed);
         self.eptp.store(state.eptp, Ordering::Relaxed);
+        self.epoch.store(epoch, Ordering::Relaxed);
         self.version.fetch_add(1, Ordering::Release);
     }
 
-    fn snapshot(&self) -> MonadResult<ActiveViewState> {
+    fn snapshot(&self) -> MonadResult<(ActiveViewState, u64)> {
         for _ in 0..8 {
             let first = self.version.load(Ordering::Acquire);
             if first & 1 != 0 {
@@ -205,9 +254,10 @@ impl ActiveViewReport {
                 },
                 eptp: self.eptp.load(Ordering::Relaxed),
             };
+            let epoch = self.epoch.load(Ordering::Relaxed);
             fence(Ordering::Acquire);
             if self.version.load(Ordering::Relaxed) == first {
-                return Ok(state);
+                return Ok((state, epoch));
             }
         }
         Err(MonadError::new(
@@ -229,11 +279,51 @@ struct Vmm {
     epoch: AtomicU64,
     rendezvous_tsc_budget: u64,
     aperture_end: u64,
+    instance_id: u64,
     published_views: PublishedViewDirectory,
 }
 
 static VMM: AtomicPtr<Vmm> = AtomicPtr::new(null_mut());
 static LIFECYCLE: Lifecycle = Lifecycle::new();
+static INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn next_epoch(sequence: &AtomicU64) -> Option<u64> {
+    sequence
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .ok()
+        .and_then(|value| value.checked_add(1))
+}
+
+fn next_instance(sequence: &AtomicU64, seed: u64) -> MonadResult<u64> {
+    sequence
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            if old == 0 {
+                Some((seed & (u64::MAX >> 1)).max(1))
+            } else {
+                old.checked_add(1)
+            }
+        })
+        .map(|old| {
+            if old == 0 {
+                (seed & (u64::MAX >> 1)).max(1)
+            } else {
+                old + 1
+            }
+        })
+        .map_err(|old| MonadError::new(ErrorPhase::Launch, ErrorCode::GenerationOverflow, old))
+}
+
+/// Read under the serialized controller token; identity also survives STOP.
+pub fn instance_identity() -> (u64, u64) {
+    let ctx = VMM.load(Ordering::Acquire);
+    if ctx.is_null() {
+        (0, 0)
+    } else {
+        unsafe { ((*ctx).instance_id, (*ctx).epoch.load(Ordering::Acquire)) }
+    }
+}
 
 pub fn lifecycle_state() -> LifecycleState {
     LIFECYCLE.state()
@@ -346,7 +436,7 @@ unsafe fn init_msr_bitmap(vcpu: *mut Vcpu) -> bool {
     unsafe {
         core::ptr::write_bytes(msr_bitmap, 0, PAGE_SIZE);
         for msr in 0u32..=0x1fff {
-            if crate::exit::msr::is_mtrr_write(msr) {
+            if crate::exit::msr::is_mtrr_write(msr, (*vcpu).mtrr_count) {
                 let index = msr as usize;
                 let byte = 2048 + index / 8;
                 *msr_bitmap.add(byte) |= 1u8 << (index & 7);
@@ -409,6 +499,7 @@ unsafe fn init_xsave_area(vcpu: *mut Vcpu) -> bool {
         (*vcpu).xsave_area = aligned;
         (*vcpu).xsave_size = size;
         (*vcpu).xsave_mask = (*vcpu).capabilities.xsave.state_mask;
+        (*vcpu).root_xcr0 = (*vcpu).capabilities.xsave.xcr0_mask;
     }
     true
 }
@@ -469,9 +560,10 @@ unsafe fn init_vcpu(
     platform: &ValidatedPlatform,
     cpu: CpuId,
     run_id: u64,
+    mtrr_count: u8,
 ) -> *mut Vcpu {
     let vcpu: *mut Vcpu =
-        unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, size_of::<Vcpu>() as u64, VMM_TAG).cast() };
+        unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE as u64, VMM_TAG).cast() };
     if vcpu.is_null() {
         log::error!(
             "vmm.rs: ExAllocatePool2 failed: size={} tag={:#x}",
@@ -482,6 +574,8 @@ unsafe fn init_vcpu(
     };
 
     unsafe {
+        (*vcpu).mtrr_count = mtrr_count;
+        (*vcpu).launch_error = None;
         (*vcpu).capabilities = platform.capabilities;
         (*vcpu).vmxon_permit = platform.vmxon_permit();
         (*vcpu).cpu = cpu;
@@ -489,7 +583,7 @@ unsafe fn init_vcpu(
             id: crate::ept::ViewId {
                 slot: 0,
                 reserved: 0,
-                generation: 1,
+                generation: run_id,
             },
             eptp: base_eptp,
         };
@@ -498,6 +592,7 @@ unsafe fn init_vcpu(
         (*vcpu).mailbox = InternalMailbox::new();
         (*vcpu).rendezvous_epoch = AtomicU64::new(0);
         (*vcpu).run_id = run_id;
+        (*vcpu).view_epoch = 0;
         (*vcpu).published_views = core::ptr::null();
         (*vcpu).events = core::ptr::null_mut();
         (*vcpu).emergency_event = EventRecord::zeroed();
@@ -643,11 +738,12 @@ pub fn vcpu_state(cpu_dense_index: u16) -> MonadResult<PublicVcpuState> {
             .map(EventRing::latest_sequence)
             .unwrap_or(0)
     };
+    let (active_view, view_epoch) = unsafe { (*vcpu).active_report.snapshot()? };
     Ok(PublicVcpuState {
         cpu_dense_index,
         active: unsafe { (*vcpu).active.load(Ordering::Acquire) },
-        active_view: unsafe { (*vcpu).active_report.snapshot()? }.id,
-        last_epoch: unsafe { (*vcpu).rendezvous_epoch.load(Ordering::Acquire) },
+        active_view: active_view.id,
+        last_epoch: view_epoch,
         last_fatal: unsafe { (*vcpu).emergency_event.status },
         last_mailbox: unsafe { (*vcpu).mailbox.status() },
         event_sequence,
@@ -688,6 +784,14 @@ fn running_manager() -> MonadResult<*mut ProductionViewManager> {
 /// caller holds the controller token at passive level.
 pub unsafe fn allocate_backing(page_count: u32, immutable: bool) -> MonadResult<BackingId> {
     unsafe { &mut *running_manager()? }.allocate_backing(page_count, immutable)
+}
+
+/// Register and pin an allocated page as a default-profile experiment target.
+///
+/// # Safety
+/// Caller holds the serialized controller token at PASSIVE_LEVEL.
+pub unsafe fn register_target(id: BackingId, page: u32) -> MonadResult<GuestPhysicalAddress> {
+    unsafe { &mut *running_manager()? }.register_target(id, page)
 }
 
 /// writes bytes into mutable backing.
@@ -833,7 +937,7 @@ pub unsafe fn list_views(output: &mut [PublicViewState]) -> MonadResult<(usize, 
         if vcpu.is_null() {
             continue;
         }
-        let active = unsafe { (*vcpu).active_report.snapshot()? }.id;
+        let active = unsafe { (*vcpu).active_report.snapshot()? }.0.id;
         if let Some(view) = output[..copied].iter_mut().find(|view| view.id == active) {
             view.active_cpu_set[cpu_index / 64] |= 1u64 << (cpu_index % 64);
         }
@@ -970,7 +1074,7 @@ unsafe fn shutdown_all(ctx: *mut Vmm) -> bool {
     if ctx.is_null() {
         return true;
     }
-    let epoch = match unsafe { (*ctx).epoch.fetch_add(1, Ordering::AcqRel) }.checked_add(1) {
+    let epoch = match next_epoch(unsafe { &(*ctx).epoch }) {
         Some(epoch) if epoch != 0 => epoch,
         _ => return false,
     };
@@ -986,7 +1090,7 @@ unsafe fn shutdown_all(ctx: *mut Vmm) -> bool {
         }
         unsafe { (*vcpu).rendezvous_epoch.store(epoch, Ordering::Release) };
         let active = match unsafe { (*vcpu).active_report.snapshot() } {
-            Ok(value) => value,
+            Ok((value, _)) => value,
             Err(_) => return false,
         };
         if unsafe {
@@ -1035,6 +1139,14 @@ fn fatal_rendezvous(cpu: u16, detail: u64) -> ! {
     }
 }
 
+fn switch_completed(
+    active: ActiveViewState,
+    target: ActiveViewState,
+    mailbox: Option<crate::rendezvous::MailboxState>,
+) -> bool {
+    active == target && mailbox == Some(crate::rendezvous::MailboxState::Completed)
+}
+
 unsafe extern "C" fn activate_cpu(context: u64) -> u64 {
     let activation = context as *const ActivationContext;
     if activation.is_null() {
@@ -1059,7 +1171,10 @@ unsafe extern "C" fn activate_cpu(context: u64) -> u64 {
     if transaction.is_target(dense) {
         // safety: passive control prepared this vcpu's mailbox.
         unsafe { rendezvous_vmcall() };
-        let switched = unsafe { (*vcpu).active_view == activation.target };
+        let switched =
+            switch_completed(unsafe { (*vcpu).active_view }, activation.target, unsafe {
+                (*vcpu).mailbox.state()
+            });
         let status = unsafe { (*vcpu).mailbox.status() };
         if switched {
             transaction.set_result(dense, CpuResultState::Switched, status);
@@ -1081,7 +1196,7 @@ unsafe extern "C" fn activate_cpu(context: u64) -> u64 {
 
     if transaction.failed.load(Ordering::Acquire)
         && transaction.is_target(dense)
-        && unsafe { (*vcpu).active_view == activation.target }
+        && transaction.per_cpu[usize::from(dense)].state() == CpuResultState::Switched as u32
     {
         let old = activation.old[usize::from(dense)];
         if unsafe { (*vcpu).mailbox.reset() }.is_err()
@@ -1173,16 +1288,13 @@ pub unsafe fn activate_published_view<A: crate::ept::EptPageAllocator + Clone>(
             targets.push(index);
         }
     }
-    let epoch = unsafe { (*ctx).epoch.fetch_add(1, Ordering::AcqRel) }
-        .checked_add(1)
-        .filter(|epoch| *epoch != 0)
-        .ok_or_else(|| {
-            MonadError::new(
-                ErrorPhase::Activation,
-                ErrorCode::GenerationOverflow,
-                u64::MAX,
-            )
-        })?;
+    let epoch = next_epoch(unsafe { &(*ctx).epoch }).ok_or_else(|| {
+        MonadError::new(
+            ErrorPhase::Activation,
+            ErrorCode::GenerationOverflow,
+            u64::MAX,
+        )
+    })?;
     let now = read_tsc();
     let deadline = now
         .checked_add(unsafe { (*ctx).rendezvous_tsc_budget })
@@ -1209,7 +1321,7 @@ pub unsafe fn activate_published_view<A: crate::ept::EptPageAllocator + Clone>(
     }
     for index in 0..cpu_count as u16 {
         let vcpu = unsafe { *(*ctx).vcpus.add(usize::from(index)) };
-        let old = unsafe { (*vcpu).active_report.snapshot()? };
+        let old = unsafe { (*vcpu).active_report.snapshot()? }.0;
         activation.old[usize::from(index)] = old;
         unsafe { (*vcpu).rendezvous_epoch.store(epoch, Ordering::Release) };
         if selection.contains(index) {
@@ -1268,40 +1380,29 @@ pub unsafe fn activate_published_view<A: crate::ept::EptPageAllocator + Clone>(
 
 unsafe fn activate_base(ctx: *mut Vmm) -> MonadResult<()> {
     let cpu_count = unsafe { (*ctx).cpu_count as u16 };
-    let base_id = crate::ept::ViewId {
-        slot: 0,
-        reserved: 0,
-        generation: 1,
-    };
+    let base_id = unsafe { &*(*ctx).manager }.base_id();
     let base_eptp = unsafe { (*ctx).published_views.resolve(base_id) }.ok_or_else(|| {
         MonadError::new(ErrorPhase::Shutdown, ErrorCode::EptVerificationFailure, 0)
     })?;
-    let mut targets = Vec::new();
-    targets
-        .try_reserve_exact(usize::from(cpu_count))
-        .map_err(|_| {
-            MonadError::new(
-                ErrorPhase::Shutdown,
-                ErrorCode::AllocationFailure,
-                u64::from(cpu_count),
-            )
-        })?;
-    targets.extend(0..cpu_count);
-    let epoch = unsafe { (*ctx).epoch.fetch_add(1, Ordering::AcqRel) }
-        .checked_add(1)
-        .filter(|epoch| *epoch != 0)
-        .ok_or_else(|| {
-            MonadError::new(
-                ErrorPhase::Shutdown,
-                ErrorCode::GenerationOverflow,
-                u64::MAX,
-            )
-        })?;
+    let targets: [u16; crate::topology::MAX_LOGICAL_CPUS] =
+        core::array::from_fn(|index| index as u16);
+    let epoch = next_epoch(unsafe { &(*ctx).epoch }).ok_or_else(|| {
+        MonadError::new(
+            ErrorPhase::Shutdown,
+            ErrorCode::GenerationOverflow,
+            u64::MAX,
+        )
+    })?;
     let now = read_tsc();
     let deadline = now
         .checked_add(unsafe { (*ctx).rendezvous_tsc_budget })
         .ok_or_else(|| MonadError::new(ErrorPhase::Shutdown, ErrorCode::AddressOverflow, now))?;
-    let transaction = RendezvousTransaction::new(epoch, cpu_count, &targets, deadline)?;
+    let transaction = RendezvousTransaction::new(
+        epoch,
+        cpu_count,
+        &targets[..usize::from(cpu_count)],
+        deadline,
+    )?;
     let target = ActiveViewState {
         id: base_id,
         eptp: base_eptp,
@@ -1314,7 +1415,7 @@ unsafe fn activate_base(ctx: *mut Vmm) -> MonadResult<()> {
     };
     for index in 0..cpu_count {
         let vcpu = unsafe { *(*ctx).vcpus.add(usize::from(index)) };
-        let old = unsafe { (*vcpu).active_report.snapshot()? };
+        let old = unsafe { (*vcpu).active_report.snapshot()? }.0;
         activation.old[usize::from(index)] = old;
         unsafe { (*vcpu).rendezvous_epoch.store(epoch, Ordering::Release) };
         if unsafe { (*vcpu).mailbox.state() }
@@ -1364,6 +1465,8 @@ unsafe fn activate_base(ctx: *mut Vmm) -> MonadResult<()> {
 
 struct LaunchContext {
     vmm: *mut Vmm,
+    mtrrs: *const crate::ept::RawMtrrState,
+    verified: AtomicU32,
     epoch: u64,
     participant_count: u32,
     arrived: AtomicU32,
@@ -1391,11 +1494,47 @@ unsafe extern "C" fn launch_cpu(context: u64) -> u64 {
     }
     let launch = unsafe { &*launch };
     let vcpu = unsafe { current_vcpu(launch.vmm) };
+    if vcpu.is_null()
+        || !unsafe { &*launch.mtrrs }.matches_registers(crate::arch::intel::state::read_msr)
+    {
+        launch.failed.store(true, Ordering::Release);
+        if !vcpu.is_null() {
+            unsafe {
+                (*vcpu).launch_error = Some(
+                    MonadError::new(ErrorPhase::Mtrr, ErrorCode::UnsupportedMtrrCombination, 0)
+                        .on_cpu((*vcpu).cpu.dense_index),
+                );
+                (*vcpu).record_transition(
+                    crate::telemetry::EventKind::LaunchFailure,
+                    ErrorCode::UnsupportedMtrrCombination as u32,
+                    ErrorPhase::Mtrr as u32,
+                );
+            }
+        }
+    }
+    launch.verified.fetch_add(1, Ordering::AcqRel);
+    if !wait_launch_barrier(&launch.verified, launch) {
+        #[cfg(not(test))]
+        fatal_rendezvous(u16::MAX, 6);
+        #[cfg(test)]
+        return 0;
+    }
+    if launch.failed.load(Ordering::Acquire) {
+        return 0; // all CPUs made the same pre-VMX decision
+    }
     if vcpu.is_null() {
         launch.failed.store(true, Ordering::Release);
     } else {
         let dense = unsafe { (*vcpu).cpu.dense_index };
-        if unsafe { init_cpu(vcpu, u32::from(dense)) }.is_err() {
+        if let Err(error) = unsafe { init_cpu(vcpu, u32::from(dense)) } {
+            unsafe {
+                (*vcpu).launch_error = Some(error);
+                (*vcpu).record_transition(
+                    crate::telemetry::EventKind::LaunchFailure,
+                    error.code as u32,
+                    error.phase as u32,
+                );
+            }
             launch.failed.store(true, Ordering::Release);
         }
     }
@@ -1462,7 +1601,7 @@ unsafe extern "C" fn launch_cpu(context: u64) -> u64 {
     1
 }
 
-/// stops all vcpus and frees vmm-owned state.
+/// stops all vcpus; retains one stopped instance for final evidence until START or close.
 ///
 /// # Safety
 ///
@@ -1473,6 +1612,9 @@ pub unsafe fn vmm_shutdown() -> MonadResult<()> {
     let lifecycle_guard = LIFECYCLE.try_control()?;
 
     let ctx = VMM.load(Ordering::Acquire);
+    if lifecycle_guard.state() == LifecycleState::Absent {
+        return Ok(());
+    }
     if ctx.is_null() {
         return if lifecycle_guard.state() == LifecycleState::Absent {
             Ok(())
@@ -1504,10 +1646,56 @@ pub unsafe fn vmm_shutdown() -> MonadResult<()> {
         ));
     }
 
-    VMM.store(null_mut(), Ordering::Release);
-    unsafe { free_vmm(ctx) };
+    // Retain one stopped instance so final records can be drained by this controller.
     lifecycle_guard.transition(LifecycleState::Stopping, LifecycleState::Absent)?;
     Ok(())
+}
+
+unsafe fn release_retained() -> MonadResult<()> {
+    let ctx = VMM.load(Ordering::Acquire);
+    if ctx.is_null() {
+        return Ok(());
+    }
+    for i in 0..unsafe { (*ctx).cpu_count } {
+        let vcpu = unsafe { *(*ctx).vcpus.add(i as usize) };
+        if !vcpu.is_null() && unsafe { (*vcpu).active.load(Ordering::Acquire) } {
+            return Err(MonadError::new(
+                ErrorPhase::Shutdown,
+                ErrorCode::ShutdownFailure,
+                u64::from(i),
+            ));
+        }
+    }
+    VMM.store(null_mut(), Ordering::Release);
+    unsafe {
+        free_vmm(ctx);
+    }
+    Ok(())
+}
+
+/// Final owner release: returning while hardware can reach the driver is forbidden.
+///
+/// # Safety
+/// PASSIVE_LEVEL, no outstanding controller requests, and no new admission.
+pub unsafe fn shutdown_and_release() {
+    let result = unsafe { vmm_shutdown() }.and_then(|()| {
+        let control = LIFECYCLE.try_control()?;
+        if control.state() != LifecycleState::Absent {
+            return Err(MonadError::new(
+                ErrorPhase::Shutdown,
+                ErrorCode::InvalidLifecycleState,
+                control.state() as u64,
+            ));
+        }
+        unsafe { release_retained() }
+    });
+    if let Err(error) = result {
+        LIFECYCLE.enter_fatal();
+        #[cfg(not(test))]
+        fatal_rendezvous(error.cpu_dense_index, error.code as u64);
+        #[cfg(test)]
+        panic!("final teardown failed: {error:?}");
+    }
 }
 
 /// starts the vmm on the startup cpu snapshot. later cpus stay native.
@@ -1523,12 +1711,9 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         committed: false,
     };
 
-    if !VMM.load(Ordering::Acquire).is_null() {
-        return Err(MonadError::new(
-            ErrorPhase::Launch,
-            ErrorCode::InvalidLifecycleState,
-            0,
-        ));
+    // The lifecycle guard proved Absent before entering Preparing.
+    unsafe {
+        release_retained()?;
     }
 
     if config.session_nonce == 0 || config.rendezvous_timeout_tsc == 0 {
@@ -1538,7 +1723,9 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
             0,
         ));
     }
+    let instance_id = next_instance(&INSTANCE_SEQUENCE, config.session_nonce)?;
     let platform = collect_capabilities()?;
+    let root_cr3 = crate::arch::intel::state::system_cr3()?;
     let architectural_limit = 1u64 << platform.capabilities.max_physical_address_bits;
     let configured_limit = if config.aperture_limit == 0 {
         DEFAULT_APERTURE_END.min(architectural_limit)
@@ -1577,14 +1764,11 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
     let manager_value = EptViewManager::new(
         base,
         WindowsPageAllocator,
-        config.session_nonce,
+        instance_id,
         platform.capabilities.max_physical_address_bits,
+        config.unrestricted_edits,
     )?;
-    let base_id = ViewId {
-        slot: 0,
-        reserved: 0,
-        generation: 1,
-    };
+    let base_id = manager_value.base_id();
     let base_eptp = manager_value.published_eptp(base_id)?;
     let manager: *mut ProductionViewManager = unsafe {
         ExAllocatePool2(
@@ -1619,6 +1803,9 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
             0,
         ));
     }
+    unsafe {
+        (*ctx).instance_id = instance_id;
+    }
     let cpu_count = unsafe { (*ctx).cpu_count };
     if unsafe { (*ctx).published_views.publish(base_id, base_eptp) }.is_err() {
         unsafe { free_vmm(ctx) };
@@ -1640,13 +1827,22 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
                 u64::from(i),
             ));
         };
-        let vcpu = unsafe { init_vcpu(base_eptp, &platform, cpu, config.session_nonce) };
+        let vcpu = unsafe {
+            init_vcpu(
+                base_eptp,
+                &platform,
+                cpu,
+                instance_id,
+                raw_mtrrs.variable.len() as u8,
+            )
+        };
         alloc_failed |= vcpu.is_null();
         if vcpu.is_null() {
             log::error!("vcpu alloc failed for processor {}", i);
         }
         unsafe {
             if !vcpu.is_null() {
+                (*vcpu).root_cr3 = root_cr3;
                 (*vcpu).published_views = core::ptr::from_ref(&(*ctx).published_views);
             }
             *(*ctx).vcpus.add(i as usize) = vcpu;
@@ -1681,13 +1877,10 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         }
     }
 
-    let epoch = unsafe { (*ctx).epoch.fetch_add(1, Ordering::AcqRel) }
-        .checked_add(1)
-        .filter(|epoch| *epoch != 0)
-        .ok_or_else(|| {
-            unsafe { free_vmm(ctx) };
-            MonadError::new(ErrorPhase::Launch, ErrorCode::GenerationOverflow, u64::MAX)
-        })?;
+    let epoch = next_epoch(unsafe { &(*ctx).epoch }).ok_or_else(|| {
+        unsafe { free_vmm(ctx) };
+        MonadError::new(ErrorPhase::Launch, ErrorCode::GenerationOverflow, u64::MAX)
+    })?;
     let now = read_tsc();
     let deadline_tsc = now
         .checked_add(unsafe { (*ctx).rendezvous_tsc_budget })
@@ -1700,6 +1893,8 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         .transition(LifecycleState::Preparing, LifecycleState::Launching)?;
     let mut launch = LaunchContext {
         vmm: ctx,
+        mtrrs: &raw_mtrrs,
+        verified: AtomicU32::new(0),
         epoch,
         participant_count: cpu_count,
         arrived: AtomicU32::new(0),
@@ -1718,12 +1913,15 @@ pub unsafe fn vmm_init(config: VmmStartConfig) -> MonadResult<()> {
         ));
     }
     if launch.failed.load(Ordering::Acquire) {
-        unsafe { free_vmm(ctx) };
-        return Err(MonadError::new(
-            ErrorPhase::Launch,
-            ErrorCode::VmxInstructionFailure,
-            0,
-        ));
+        let error =
+            (0..cpu_count).find_map(|i| unsafe { (**(*ctx).vcpus.add(i as usize)).launch_error });
+        if let Some(error) = error {
+            log::error!("launch failed: {error:?}");
+        }
+        VMM.store(ctx, Ordering::Release);
+        return Err(error.unwrap_or_else(|| {
+            MonadError::new(ErrorPhase::Launch, ErrorCode::VmxInstructionFailure, 0)
+        }));
     }
 
     start_transition
@@ -1825,24 +2023,41 @@ unsafe fn stop_cpu(vcpu: *mut Vcpu) -> ! {
         (*vcpu).regs.rflags = rflags;
     }
 
+    unsafe {
+        (*vcpu).record_transition(crate::telemetry::EventKind::ShutdownEntry, 0, 0);
+    }
+    let native = match NativeReturnState::capture(vmread) {
+        Ok(state) => state,
+        Err(_) => unsafe { fatal_vmexit(vcpu, FatalReason::InvalidVcpuState) },
+    };
     unsafe { vmxoff_or_fatal(vcpu) };
 
     // vmxoff makes this vcpu unreachable to hardware.
-    unsafe { (*vcpu).active.store(false, Ordering::Release) };
+    unsafe {
+        (*vcpu).active.store(false, Ordering::Release);
+        (*vcpu).record_transition(crate::telemetry::EventKind::VmxoffCompletion, 0, 0);
+    }
 
     unsafe {
         write_msr(IA32_SYSENTER_CS, guest_sysenter_cs);
         write_msr(IA32_SYSENTER_ESP, guest_sysenter_esp);
         write_msr(IA32_SYSENTER_EIP, guest_sysenter_eip);
-        write_cr0(guest_cr0);
         write_cr3(guest_cr3);
         write_cr4((guest_cr4 & !(1 << 13)) | ((*vcpu).original_controls.cr4 & (1 << 13)));
-        let mut debug = (*vcpu).original_debug;
-        debug.dr7 = guest_dr7;
-        write_debug_state(debug);
+        native.restore();
+        // DR0-3/6 stay live throughout root execution; startup values are obsolete.
+        write_dr7(guest_dr7);
     }
 
-    unsafe { restore_guest(&(*vcpu).regs, (*vcpu).xsave_area, (*vcpu).xsave_mask) }
+    unsafe {
+        restore_guest(
+            &(*vcpu).regs,
+            (*vcpu).xsave_area,
+            (*vcpu).xsave_mask,
+            (*vcpu).guest_xcr0,
+            guest_cr0,
+        )
+    }
 }
 
 #[cfg(not(test))]
@@ -1924,15 +2139,12 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
     let original = match prepare_control_registers(unsafe { &(*vcpu).capabilities }) {
         Ok(original) => original,
         Err(error) => {
-            log::error!("control-register preparation failed on processor {cpu}: {error:?}");
             return Err(error.on_cpu(cpu_index));
         }
     };
     unsafe { (*vcpu).original_controls = original };
-    unsafe { (*vcpu).original_debug = read_debug_state() };
 
     if let Err(error) = vmxon(unsafe { (*vcpu).vmxon_pa }, unsafe { (*vcpu).vmxon_permit }) {
-        log::error!("VMXON instruction failed on vcpu {:p}: {error:?}", vcpu);
         restore_control_registers(original);
         return Err(error.on_cpu(cpu_index));
     }
@@ -1940,18 +2152,16 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
     let guest_desc = match unsafe { Descriptors::capture_current() } {
         Ok(descriptors) => descriptors,
         Err(error) => {
-            log::error!("guest descriptor capture failed on processor {cpu}: {error:?}");
             unsafe { vmxoff_or_fatal(vcpu) };
             restore_control_registers(original);
             return Err(error.on_cpu(cpu_index));
         }
     };
     (*vcpu).guest_desc = guest_desc;
-    // the host still shares the guest's address space.
+    // Per-CPU kernel descriptors are retained; root paging belongs to the system process.
     let host_desc = match unsafe { Descriptors::capture_current() } {
         Ok(descriptors) => descriptors,
         Err(error) => {
-            log::error!("host descriptor capture failed on processor {cpu}: {error:?}");
             unsafe { vmxoff_or_fatal(vcpu) };
             restore_control_registers(original);
             return Err(error.on_cpu(cpu_index));
@@ -1959,14 +2169,11 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
     };
     (*vcpu).host_desc = host_desc;
 
-    log::info!("vcpu {:p} in VMX operation on processor {}", vcpu, cpu);
-
     unsafe { capture_registers(&mut (*vcpu).regs) };
 
     match unsafe { setup_vmcs(vcpu) } {
         Ok(()) => {}
         Err(error) => {
-            log::error!("VMCS instruction failed on processor {}: {error:?}", cpu);
             unsafe { vmxoff_or_fatal(vcpu) };
             restore_control_registers(original);
             return Err(error.on_cpu(cpu_index));
@@ -1976,18 +2183,88 @@ unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> MonadResult<()> {
     // hardware may touch vmx allocations until vmxoff.
     unsafe { (*vcpu).active.store(true, Ordering::Release) };
     if let Err(error) = unsafe { vmlaunch(&mut (*vcpu).regs) } {
-        log::error!("VMLAUNCH failed on processor {cpu}: {error:?}");
         unsafe { vmxoff_or_fatal(vcpu) };
         unsafe { (*vcpu).active.store(false, Ordering::Release) };
+        // Failed initial entry returned with the root mask; native caller owns the original.
+        crate::arch::intel::state::restore_native_xcr0(unsafe { (*vcpu).guest_xcr0 });
         restore_control_registers(original);
         return Err(error.on_cpu(cpu_index));
     }
     if unsafe { (*vcpu).active.load(Ordering::Acquire) } {
+        unsafe {
+            (*vcpu).record_transition(crate::telemetry::EventKind::VmmLaunch, 0, 0);
+        }
         Ok(())
     } else {
         Err(
             MonadError::new(ErrorPhase::Launch, ErrorCode::LaunchRollbackFailure, 0)
                 .on_cpu(cpu_index),
         )
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    #[test]
+    fn instance_sequence_does_not_repeat_or_wrap() {
+        let sequence = AtomicU64::new(0);
+        let first = next_instance(&sequence, 0x1234).expect("first");
+        let second = next_instance(&sequence, 0x1234).expect("second");
+        assert_eq!(second, first + 1);
+        assert_eq!(
+            next_instance(&sequence, 0x8888).expect("new controller"),
+            second + 1
+        );
+        sequence.store(u64::MAX, Ordering::Release);
+        assert!(next_instance(&sequence, 0x1234).is_err());
+        assert_eq!(sequence.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(next_epoch(&sequence), None);
+        assert_eq!(sequence.load(Ordering::Acquire), u64::MAX);
+        sequence.store(0, Ordering::Release);
+        assert_eq!(next_epoch(&sequence), Some(1));
+    }
+
+    #[test]
+    fn failed_noop_switch_is_not_reported_as_committed() {
+        let view = ActiveViewState {
+            id: ViewId {
+                slot: 0,
+                reserved: 0,
+                generation: 8,
+            },
+            eptp: 0x101e,
+        };
+        for state in [
+            crate::rendezvous::MailboxState::Failed,
+            crate::rendezvous::MailboxState::Executing,
+        ] {
+            assert!(!switch_completed(view, view, Some(state)));
+        }
+        assert!(switch_completed(
+            view,
+            view,
+            Some(crate::rendezvous::MailboxState::Completed)
+        ));
+    }
+
+    #[test]
+    fn active_report_keeps_effective_view_and_epoch_together() {
+        let old = ActiveViewState {
+            id: ViewId {
+                slot: 0,
+                reserved: 0,
+                generation: 8,
+            },
+            eptp: 0x101e,
+        };
+        let report = ActiveViewReport::new(old);
+        assert_eq!(report.snapshot().expect("initial"), (old, 0));
+        let new = ActiveViewState {
+            id: ViewId { slot: 1, ..old.id },
+            eptp: 0x201e,
+        };
+        report.publish(new, 7);
+        assert_eq!(report.snapshot().expect("committed"), (new, 7));
     }
 }
