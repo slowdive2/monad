@@ -73,6 +73,7 @@ try {
         throw 'release driver does not export DriverEntry'
     }
 
+    & (Join-Path $scriptDirectory 'check-state-artifact.ps1')
     & (Join-Path $scriptDirectory 'check-research.ps1')
 }
 finally {

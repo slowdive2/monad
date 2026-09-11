@@ -38,6 +38,8 @@ pub struct EptViewManager<A: EptPageAllocator + Clone> {
     next_publish_slot: u16,
     session_nonce: u64,
     max_physical_bits: u8,
+    unrestricted_edits: bool,
+    targets: Vec<(super::HostPhysicalAddress, BackingPageReference)>,
 }
 
 impl<A: EptPageAllocator + Clone> EptViewManager<A> {
@@ -46,6 +48,7 @@ impl<A: EptPageAllocator + Clone> EptViewManager<A> {
         allocator: A,
         session_nonce: u64,
         max_physical_bits: u8,
+        unrestricted_edits: bool,
     ) -> MonadResult<Self> {
         if session_nonce == 0 {
             return Err(MonadError::new(
@@ -54,12 +57,12 @@ impl<A: EptPageAllocator + Clone> EptViewManager<A> {
                 0,
             ));
         }
-        let image = ViewImage::from_base(base);
+        let image = ViewImage::from_base(base, session_nonce);
         let metadata = image.verify()?;
         let base_id = ViewId {
             slot: 0,
             reserved: 0,
-            generation: 1,
+            generation: session_nonce,
         };
         let base = Box::pin(PublishedView::new(base_id, image, metadata));
         let mut published = core::array::from_fn(|_| None);
@@ -71,6 +74,8 @@ impl<A: EptPageAllocator + Clone> EptViewManager<A> {
             next_publish_slot: 1,
             session_nonce,
             max_physical_bits,
+            unrestricted_edits,
+            targets: Vec::new(),
         })
     }
 
@@ -198,6 +203,10 @@ impl<A: EptPageAllocator + Clone> EptViewManager<A> {
             ));
         }
         let index = self.draft_index(id)?;
+        for (index, edit) in edits.iter().enumerate() {
+            self.validate_target_edit(*edit)
+                .map_err(|error| error.at_operation(index as u32))?;
+        }
         let old_refs = self.drafts[index]
             .draft
             .as_ref()
@@ -264,7 +273,7 @@ impl<A: EptPageAllocator + Clone> EptViewManager<A> {
         let view_id = ViewId {
             slot: self.next_publish_slot,
             reserved: 0,
-            generation: 1,
+            generation: self.session_nonce,
         };
         let (image, metadata) = draft.image.mark_published(draft.source, metadata);
         self.published[publish_index] =
@@ -296,6 +305,78 @@ impl<A: EptPageAllocator + Clone> EptViewManager<A> {
 
     pub fn metadata(&self, id: ViewId) -> MonadResult<ViewMetadata> {
         Ok(self.published(id)?.metadata())
+    }
+
+    pub fn base_id(&self) -> ViewId {
+        ViewId {
+            slot: 0,
+            reserved: 0,
+            generation: self.session_nonce,
+        }
+    }
+
+    /// Pin a dedicated allocation page; it cannot become a stack/table/control object.
+    pub fn register_target(
+        &mut self,
+        backing: BackingId,
+        page_index: u32,
+    ) -> MonadResult<GuestPhysicalAddress> {
+        let reference = BackingPageReference {
+            backing_id: backing,
+            page_index,
+        };
+        let hpa = self.backings.page_hpa(reference, self.session_nonce)?;
+        let gpa = GuestPhysicalAddress::from_page_aligned(hpa.get())?;
+        match self.walk(self.base_id(), gpa)? {
+            WalkResult::Mapping(mapping)
+                if mapping.memory_type == super::EptMemoryType::WriteBack => {}
+            _ => {
+                return Err(MonadError::new(
+                    ErrorPhase::DraftEdit,
+                    ErrorCode::UnsupportedMtrrCombination,
+                    hpa.get(),
+                ))
+            }
+        }
+        if !self.targets.iter().any(|(physical, _)| *physical == hpa) {
+            self.targets.try_reserve(1).map_err(|_| {
+                MonadError::new(ErrorPhase::DraftEdit, ErrorCode::AllocationFailure, 1)
+            })?;
+            self.backings.pin_target(backing, self.session_nonce)?;
+            self.targets.push((hpa, reference));
+        }
+        Ok(gpa)
+    }
+
+    fn validate_target_edit(&self, edit: DraftEdit) -> MonadResult<()> {
+        if self.unrestricted_edits {
+            return Ok(());
+        }
+        let (start, end) = match edit {
+            DraftEdit::SetPermissions { range, .. } | DraftEdit::RestoreFromBase { range } => {
+                (range.start().get(), range.end()?)
+            }
+            DraftEdit::MapBacking4K { gpa, .. } => (
+                gpa.get(),
+                gpa.get().checked_add(super::PAGE_SIZE_4K).ok_or_else(|| {
+                    MonadError::new(ErrorPhase::DraftEdit, ErrorCode::AddressOverflow, gpa.get())
+                })?,
+            ),
+        };
+        // Bound validation by the owned page count, even for a malicious huge range.
+        let covered = self
+            .targets
+            .iter()
+            .filter(|(hpa, _)| hpa.get() >= start && hpa.get() < end)
+            .count() as u64;
+        if covered != (end - start) / super::PAGE_SIZE_4K {
+            return Err(MonadError::new(
+                ErrorPhase::DraftEdit,
+                ErrorCode::AccessDenied,
+                start,
+            ));
+        }
+        Ok(())
     }
 
     pub fn allocate_backing(&mut self, page_count: u32, immutable: bool) -> MonadResult<BackingId> {
@@ -384,7 +465,7 @@ mod tests {
         FakePageAllocator,
         Rc<FakePageStats>,
     ) {
-        let allocator = FakePageAllocator::new(0x1000_0000_0000, None);
+        let allocator = FakePageAllocator::new(0x1000_0000, None);
         let stats = Rc::clone(&allocator.stats);
         let inventory = PhysicalInventory::ingest(
             &[PhysicalRange {
@@ -409,7 +490,7 @@ mod tests {
         let base = build_base_view(allocator.clone(), inventory, memory, 48, true, true, false)
             .expect("base");
         (
-            EptViewManager::new(base, allocator.clone(), 0x55aa, 48).expect("manager"),
+            EptViewManager::new(base, allocator.clone(), 0x55aa, 48, true).expect("manager"),
             allocator,
             stats,
         )
@@ -419,7 +500,7 @@ mod tests {
         ViewId {
             slot: 0,
             reserved: 0,
-            generation: 1,
+            generation: 0x55aa,
         }
     }
 
@@ -697,5 +778,157 @@ mod tests {
             manager.metadata(published).expect("metadata").source,
             base_id()
         );
+    }
+    #[test]
+    fn registered_target_ownership_precedes_any_batch_mutation() {
+        let (mut manager, _, _) = manager();
+        manager.unrestricted_edits = false;
+        let target = manager
+            .allocate_backing(1, false)
+            .expect("target allocation");
+        let gpa = manager
+            .register_target(target, 0)
+            .expect("register owned page");
+        assert_eq!(
+            manager
+                .register_target(target, 0)
+                .expect("idempotent registration"),
+            gpa
+        );
+        assert_eq!(
+            manager
+                .free_backing(target)
+                .expect_err("target remains owned")
+                .code,
+            ErrorCode::BackingStillReferenced
+        );
+        let draft = manager.create_draft(manager.base_id()).expect("draft");
+        let overflowing = DraftEdit::MapBacking4K {
+            gpa: GuestPhysicalAddress::from_page_aligned(!0xfffu64).expect("aligned"),
+            backing: BackingPageReference {
+                backing_id: target,
+                page_index: 0,
+            },
+            permissions: all(),
+            memory_type: BackingMemoryType::WriteBack,
+        };
+        assert_eq!(
+            manager
+                .apply_batch(draft, &[overflowing])
+                .expect_err("overflow")
+                .code,
+            ErrorCode::AddressOverflow
+        );
+        let before = manager.walk_draft(draft, gpa).expect("before");
+        let edit = DraftEdit::SetPermissions {
+            range: super::super::GpaRange::new(gpa.get(), 4096, ONE_GIB).expect("range"),
+            permissions: super::super::EptPermissions::new(true, false, false, false)
+                .expect("permissions"),
+        };
+        let unowned = DraftEdit::SetPermissions {
+            range: super::super::GpaRange::new(0, 4096, ONE_GIB).expect("range"),
+            permissions: all(),
+        };
+        assert_eq!(
+            manager
+                .apply_batch(draft, &[edit, unowned])
+                .expect_err("unowned footprint")
+                .operation_index,
+            1
+        );
+        assert_eq!(
+            manager.walk_draft(draft, gpa).expect("atomic failure"),
+            before
+        );
+        manager
+            .apply_batch(draft, &[edit])
+            .expect("owned intervention");
+        assert_ne!(manager.walk_draft(draft, gpa).expect("after"), before);
+        manager
+            .write_backing(target, 0, &[1])
+            .expect("target remains mutable before publication");
+    }
+
+    #[test]
+    fn handles_from_another_instance_cannot_select_replacement_objects() {
+        let (mut old, _, _) = manager();
+        let old_base = old.base_id();
+        let old_draft = old.create_draft(old_base).expect("old draft");
+        let old_backing = old.allocate_backing(1, false).expect("old backing");
+        let old_view = old.publish_draft(old_draft).expect("old view");
+        let (next, allocator, _) = manager();
+        // Same slots/generations, new instance; use the production constructor.
+        drop(next);
+        let inventory = PhysicalInventory::ingest(
+            &[PhysicalRange {
+                start: 0,
+                length: ONE_GIB,
+                kind: PhysicalRangeKind::Memory,
+            }],
+            &[],
+            48,
+            Some(ONE_GIB),
+        )
+        .expect("inventory");
+        let memory = NormalizedMemoryMap::from_intervals(
+            &[MemoryTypeInterval {
+                start: 0,
+                end_exclusive: ONE_GIB,
+                memory_type: EptMemoryType::WriteBack,
+            }],
+            ONE_GIB,
+        )
+        .expect("memory");
+        let base = build_base_view(allocator.clone(), inventory, memory, 48, true, true, false)
+            .expect("base");
+        let mut next =
+            EptViewManager::new(base, allocator, 0x55ab, 48, true).expect("next instance");
+        let draft = next
+            .create_draft(next.base_id())
+            .expect("replacement draft");
+        let backing = next
+            .allocate_backing(1, false)
+            .expect("replacement backing");
+        let view = next.publish_draft(draft).expect("replacement view");
+        assert_eq!(old_backing.slot, backing.slot);
+        assert_eq!(old_view.slot, view.slot);
+        assert!(next.published_view(old_base).is_err());
+        assert!(next.published_view(old_view).is_err());
+        assert!(next.discard_draft(old_draft).is_err());
+        assert!(next.free_backing(old_backing).is_err());
+    }
+
+    #[test]
+    fn cached_backing_rejects_uncacheable_or_uncovered_physical_aliases() {
+        let (mut manager, _, _) = manager();
+        let backing = manager.allocate_backing(1, false).expect("backing");
+        let draft = manager.create_draft(manager.base_id()).expect("draft");
+        let gpa = GuestPhysicalAddress::from_page_aligned(0x2000).expect("gpa");
+        let reference = BackingPageReference {
+            backing_id: backing,
+            page_index: 0,
+        };
+        let edit = DraftEdit::MapBacking4K {
+            gpa,
+            backing: reference,
+            permissions: all(),
+            memory_type: super::super::BackingMemoryType::Uncacheable,
+        };
+        assert!(manager.apply_batch(draft, &[edit]).is_err());
+        // Exercise the actual candidate's physical-type lookup with an HPA outside
+        // its map; syntactically valid WB must not substitute for physical evidence.
+        let index = manager.draft_index(draft).expect("draft index");
+        let image = &mut manager.drafts[index].draft.as_mut().expect("draft").image;
+        let wb = DraftEdit::MapBacking4K {
+            gpa,
+            backing: reference,
+            permissions: all(),
+            memory_type: super::super::BackingMemoryType::WriteBack,
+        };
+        assert!(image
+            .apply_edit(wb, |_| super::super::HostPhysicalAddress::for_mapping(
+                ONE_GIB, 4096, 4096, 48
+            ))
+            .is_err());
     }
 }

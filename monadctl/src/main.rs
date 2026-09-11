@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use monad_research::{compile_plan, prepare_evidence_bundle, ExperimentPack};
+use monad_research::{compile_plan, prepare_evidence_bundle, source_digest, ExperimentPack};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -17,9 +17,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// hash the current source manifest, including untracked source files.
+    SourceDigest {
+        #[arg(default_value = ".")]
+        repository: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// validate an experiment pack and print its canonical sha-256 identity.
     Validate { pack: PathBuf },
-    /// compile a validated pack into a deterministic execution plan.
+    /// summarize a statically validated plan; machine and target preflight are still required.
     Plan {
         pack: PathBuf,
         #[arg(long)]
@@ -29,11 +36,7 @@ enum Command {
     Prepare {
         pack: PathBuf,
         output: PathBuf,
-        #[arg(
-            long,
-            default_value = "qualification/source-manifest.sha256",
-            value_name = "FILE"
-        )]
+        #[arg(long, value_name = "FILE")]
         source_digest: PathBuf,
     },
 }
@@ -45,6 +48,14 @@ fn load(path: &PathBuf) -> Result<ExperimentPack, Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
+        Command::SourceDigest { repository, output } => {
+            let digest = source_digest(&repository)?;
+            if let Some(output) = output {
+                fs::write(output, format!("{digest}\n"))?;
+            } else {
+                println!("{digest}");
+            }
+        }
         Command::Validate { pack } => {
             let pack = load(&pack)?;
             let plan = compile_plan(&pack)?;

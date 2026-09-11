@@ -225,7 +225,7 @@ fn leaf_entry(
 }
 
 impl<A: EptPageAllocator + Clone> ViewImage<A> {
-    pub(super) fn from_base(base: VerifiedBaseView<A>) -> Self {
+    pub(super) fn from_base(base: VerifiedBaseView<A>, instance_id: u64) -> Self {
         let BaseViewCandidate {
             root,
             mut pages,
@@ -247,7 +247,7 @@ impl<A: EptPageAllocator + Clone> ViewImage<A> {
             source: ViewId {
                 slot: 0,
                 reserved: 0,
-                generation: 1,
+                generation: instance_id,
             },
             edit_count: 0,
         }
@@ -521,7 +521,13 @@ impl<A: EptPageAllocator + Clone> ViewImage<A> {
                     .memory_types
                     .memory_type_at(gpa.get())
                     .ok_or_else(|| edit_error(ErrorCode::InvalidRange, gpa.get()))?;
-                if EptMemoryType::from(memory_type) != base_type {
+                let hpa = resolve_backing(backing)?;
+                // Backings have a cached kernel alias. GPA type alone says nothing
+                // about the new physical storage or its identity aliases.
+                if EptMemoryType::from(memory_type) != EptMemoryType::WriteBack
+                    || base_type != EptMemoryType::WriteBack
+                    || self.memory_types.memory_type_at(hpa.get()) != Some(EptMemoryType::WriteBack)
+                {
                     return Err(edit_error(
                         ErrorCode::UnsupportedMtrrCombination,
                         base_type as u64,
@@ -529,7 +535,7 @@ impl<A: EptPageAllocator + Clone> ViewImage<A> {
                 }
                 let mapping = PageOverride {
                     gpa,
-                    hpa: resolve_backing(backing)?,
+                    hpa,
                     permissions,
                     memory_type: base_type,
                     backing: Some(backing),

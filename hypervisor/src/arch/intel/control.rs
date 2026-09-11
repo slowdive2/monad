@@ -72,8 +72,8 @@ pub const ENABLE_INVPCID: u32 = 1 << 12;
 pub const ENABLE_XSAVES_XRSTORS: u32 = 1 << 20;
 pub const ENABLE_USER_WAIT_PAUSE: u32 = 1 << 26;
 pub const REQUIRED_SECONDARY: u32 = ENABLE_EPT | ENABLE_XSAVES_XRSTORS;
-pub const REQUIRED_VMEXIT: u32 = 1 << 9;
-pub const REQUIRED_VMENTRY: u32 = 1 << 9;
+pub const REQUIRED_VMEXIT: u32 = (1 << 9) | (1 << 2);
+pub const REQUIRED_VMENTRY: u32 = (1 << 9) | (1 << 2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlCapabilities {
@@ -90,7 +90,7 @@ impl ControlCapabilities {
     }
 
     pub fn controls_for(self, requested_secondary: u32) -> MonadResult<VmxControls> {
-        Ok(VmxControls {
+        let controls = VmxControls {
             pinbased: self
                 .pinbased
                 .adjust(ControlField::PinBased, REQUIRED_PINBASED)?,
@@ -105,7 +105,56 @@ impl ControlCapabilities {
             vmentry: self
                 .vmentry
                 .adjust(ControlField::VmEntry, REQUIRED_VMENTRY)?,
-        })
+        };
+        // Reserved default-1 bits are harmless only in their mandatory setting.
+        // A newly flexible bit is not silently treated as reserved.
+        for (field, capability, actual, requested, legacy) in [
+            (
+                ControlField::PinBased,
+                self.pinbased,
+                controls.pinbased,
+                REQUIRED_PINBASED,
+                0x16,
+            ),
+            (
+                ControlField::PrimaryProcessorBased,
+                self.primary,
+                controls.primary,
+                REQUIRED_PRIMARY,
+                0x04006172,
+            ),
+            (
+                ControlField::SecondaryProcessorBased,
+                self.secondary,
+                controls.secondary,
+                requested_secondary | REQUIRED_SECONDARY,
+                0,
+            ),
+            (
+                ControlField::VmExit,
+                self.vmexit,
+                controls.vmexit,
+                REQUIRED_VMEXIT,
+                0x36dff & !((1 << 2) | (1 << 9) | (1 << 12) | (1 << 15)),
+            ),
+            (
+                ControlField::VmEntry,
+                self.vmentry,
+                controls.vmentry,
+                REQUIRED_VMENTRY,
+                0x11ff & !(1 << 2),
+            ),
+        ] {
+            let unsupported = actual & !(requested | (legacy & capability.must_be_one));
+            if unsupported != 0 {
+                return Err(MonadError::new(
+                    ErrorPhase::Capability,
+                    ErrorCode::UnsupportedCapability,
+                    ((field as u64) << 32) | u64::from(unsupported),
+                ));
+            }
+        }
+        Ok(controls)
     }
 }
 
@@ -159,5 +208,35 @@ mod tests {
             controls.secondary,
             REQUIRED_SECONDARY | ENABLE_RDTSCP | ENABLE_INVPCID | ENABLE_USER_WAIT_PAUSE
         );
+    }
+    #[test]
+    fn effective_controls_reject_unimplemented_mandatory_behavior() {
+        let base = ControlCapabilities {
+            pinbased: ControlCapability::unrestricted(),
+            primary: ControlCapability::unrestricted(),
+            secondary: ControlCapability::unrestricted(),
+            vmexit: ControlCapability::unrestricted(),
+            vmentry: ControlCapability::unrestricted(),
+        };
+        for bit in [0, 5, 7, 13, 17, 18, 25] {
+            let caps = ControlCapabilities {
+                secondary: ControlCapability::from_msr((u64::from(u32::MAX) << 32) | (1 << bit)),
+                ..base
+            };
+            assert!(
+                caps.required_controls().is_err(),
+                "unimplemented secondary bit {bit}"
+            );
+        }
+        let legacy = ControlCapabilities {
+            pinbased: ControlCapability::from_msr((u64::from(u32::MAX) << 32) | 0x16),
+            ..base
+        };
+        assert!(legacy.required_controls().is_ok());
+        let exits = ControlCapabilities {
+            primary: ControlCapability::from_msr((u64::from(u32::MAX) << 32) | (1 << 15)),
+            ..base
+        };
+        assert!(exits.required_controls().is_err());
     }
 }

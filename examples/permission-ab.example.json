@@ -59,7 +59,7 @@
   "expected_outcomes": [
     {
       "name": "write-violation",
-      "oracle": "Monad event records for the selected GPA and activation epoch",
+      "oracle": "Monad event records for the registered target GPA, instance ID, and effective view epoch",
       "predicate": "zero matching exits in base steps and at least one matching write exit in the treatment step"
     }
   ],

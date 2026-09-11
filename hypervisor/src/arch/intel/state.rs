@@ -286,15 +286,65 @@ pub(crate) fn write_msr(msr: u32, value: u64) {
 }
 
 pub(crate) fn read_cr0() -> u64 {
-    // safety: monad calls this only from cpl0 kernel context.
-    unsafe { x86::controlregs::cr0().bits() as u64 }
+    let value: u64;
+    // safety: kernel-only architectural capture; never truncate unknown bits.
+    unsafe {
+        asm!("mov {}, cr0", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
 }
 
 pub(crate) fn write_cr0(value: u64) {
-    // safety: vmx fixed masks validated the value.
+    // safety: caller validates the complete raw architectural value.
     unsafe {
-        x86::controlregs::cr0_write(x86::controlregs::Cr0::from_bits_truncate(value as usize))
+        asm!("mov cr0, {}", in(reg) value, options(nostack, preserves_flags));
+    }
+}
+
+/// Capture the system process's kernel root while briefly attached at PASSIVE_LEVEL.
+pub(crate) fn system_cr3() -> MonadResult<u64> {
+    use wdk_sys::{
+        ntddk::{KeGetCurrentIrql, KeStackAttachProcess, KeUnstackDetachProcess},
+        KAPC_STATE, PEPROCESS,
     };
+    if unsafe { KeGetCurrentIrql() } != 0 {
+        return Err(MonadError::new(
+            ErrorPhase::Launch,
+            ErrorCode::InvalidLifecycleState,
+            0,
+        ));
+    }
+    // COFF data imports have no function thunk. Bind the IAT slot explicitly;
+    // the generated wdk-sys declaration omits dllimport for this exported variable.
+    unsafe extern "system" {
+        #[link_name = "__imp_PsInitialSystemProcess"]
+        static SYSTEM_PROCESS_IMPORT: *const PEPROCESS;
+    }
+    let process = unsafe { *SYSTEM_PROCESS_IMPORT };
+    if process.is_null() {
+        return Err(MonadError::new(
+            ErrorPhase::Launch,
+            ErrorCode::InvalidGuestState,
+            0,
+        ));
+    }
+    let mut apc = unsafe { core::mem::zeroed::<KAPC_STATE>() };
+    // No allocation, I/O or fallible operation occurs while attached.
+    unsafe {
+        KeStackAttachProcess(process.cast(), &mut apc);
+    }
+    let root = read_cr3() & !0xfff;
+    unsafe {
+        KeUnstackDetachProcess(&mut apc);
+    }
+    if root == 0 {
+        return Err(MonadError::new(
+            ErrorPhase::Launch,
+            ErrorCode::InvalidGuestState,
+            0,
+        ));
+    }
+    Ok(root)
 }
 
 pub(crate) fn read_cr3() -> u64 {
@@ -308,15 +358,26 @@ pub(crate) fn write_cr3(value: u64) {
 }
 
 pub(crate) fn read_cr4() -> u64 {
-    // safety: monad calls this only from cpl0 kernel context.
-    unsafe { x86::controlregs::cr4().bits() as u64 }
+    let value: u64;
+    // safety: kernel-only architectural capture; never truncate unknown bits.
+    unsafe {
+        asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
 }
 
 pub(crate) fn write_cr4(value: u64) {
-    // safety: vmx fixed masks validated the value.
+    // safety: caller validates the complete raw architectural value.
     unsafe {
-        x86::controlregs::cr4_write(x86::controlregs::Cr4::from_bits_truncate(value as usize))
-    };
+        asm!("mov cr4, {}", in(reg) value, options(nostack, preserves_flags));
+    }
+}
+
+pub(crate) fn restore_native_xcr0(value: u64) {
+    // safety: this is the captured pre-launch XCR0 on the same CPU.
+    unsafe {
+        core::arch::x86_64::_xsetbv(0, value);
+    }
 }
 
 pub(crate) fn read_dr7() -> u64 {
@@ -369,6 +430,72 @@ pub unsafe fn write_debug_state(state: crate::lifecycle::DebugState) {
         asm!("mov dr6, {}", in(reg) state.dr6, options(nostack, preserves_flags));
     }
     write_dr7(state.dr7);
+}
+
+/// State loaded implicitly by VM exit that native return must reconstruct.
+/// CR2, DR0-3/6, KERNEL_GS_BASE, PAT and EFER remain live and are not modified by root.
+pub(crate) struct NativeReturnState {
+    gdtr: DescriptorTablePointer<u64>,
+    idtr: DescriptorTablePointer<u64>,
+    selectors: [u16; 4],
+    fs_base: u64,
+    gs_base: u64,
+    debugctl: u64,
+}
+
+impl NativeReturnState {
+    pub(crate) fn capture(mut read: impl FnMut(u32) -> MonadResult<u64>) -> MonadResult<Self> {
+        use x86::vmx::vmcs::{guest as g, host as h};
+        // Keep the controlled Windows CPL0/TSS return profile; no busy-TSS rewriting.
+        if read(g::CS_SELECTOR)? != read(h::CS_SELECTOR)?
+            || read(g::SS_SELECTOR)? != read(h::SS_SELECTOR)?
+            || read(g::TR_SELECTOR)? != read(h::TR_SELECTOR)?
+            || read(g::TR_BASE)? != read(h::TR_BASE)?
+            || read(g::TR_LIMIT)? != 0x67
+            || read(g::LDTR_SELECTOR)? != 0
+        {
+            return Err(MonadError::new(
+                ErrorPhase::Shutdown,
+                ErrorCode::InvalidGuestState,
+                0,
+            ));
+        }
+        Ok(Self {
+            gdtr: DescriptorTablePointer {
+                limit: read(g::GDTR_LIMIT)? as u16,
+                base: read(g::GDTR_BASE)? as *const u64,
+            },
+            idtr: DescriptorTablePointer {
+                limit: read(g::IDTR_LIMIT)? as u16,
+                base: read(g::IDTR_BASE)? as *const u64,
+            },
+            selectors: [
+                read(g::DS_SELECTOR)? as u16,
+                read(g::ES_SELECTOR)? as u16,
+                read(g::FS_SELECTOR)? as u16,
+                read(g::GS_SELECTOR)? as u16,
+            ],
+            fs_base: read(g::FS_BASE)?,
+            gs_base: read(g::GS_BASE)?,
+            debugctl: read(g::IA32_DEBUGCTL_FULL)?,
+        })
+    }
+
+    /// # Safety
+    /// VMX is off on the captured CPU; guest CR3 and the CPL0 return profile are active.
+    pub(crate) unsafe fn restore(&self) {
+        unsafe {
+            x86::dtables::lgdt(&self.gdtr);
+            x86::dtables::lidt(&self.idtr);
+            asm!("mov ds, {ds:x}", "mov es, {es:x}", "mov fs, {fs:x}", "mov gs, {gs:x}",
+                ds=in(reg) self.selectors[0], es=in(reg) self.selectors[1],
+                fs=in(reg) self.selectors[2], gs=in(reg) self.selectors[3],
+                options(nostack, preserves_flags));
+        }
+        write_msr(x86::msr::IA32_FS_BASE, self.fs_base);
+        write_msr(x86::msr::IA32_GS_BASE, self.gs_base);
+        write_msr(0x1d9, self.debugctl);
+    }
 }
 
 #[cfg(test)]
@@ -425,5 +552,43 @@ mod tests {
             normalize_control_state(0, 1, u64::MAX, 0, 0).map_err(|error| error.code),
             Err(ErrorCode::InvalidGuestState)
         );
+    }
+    #[test]
+    fn native_return_reads_current_descriptor_and_base_state() {
+        use x86::vmx::vmcs::{guest as g, host as h};
+        let read = |field| {
+            Ok(match field {
+                g::CS_SELECTOR | h::CS_SELECTOR => 0x10,
+                g::SS_SELECTOR | h::SS_SELECTOR => 0x18,
+                g::TR_SELECTOR | h::TR_SELECTOR => 0x40,
+                g::TR_BASE | h::TR_BASE => 0x9000,
+                g::TR_LIMIT => 0x67,
+                g::GDTR_LIMIT => 0x77,
+                g::IDTR_LIMIT => 0xfff,
+                g::GDTR_BASE => 0x1000,
+                g::IDTR_BASE => 0x2000,
+                g::FS_BASE => 0x3000,
+                g::GS_BASE => 0x4000,
+                g::IA32_DEBUGCTL_FULL => 0x5,
+                _ => 0,
+            })
+        };
+        let state = NativeReturnState::capture(read).expect("current state");
+        let (gdt_limit, idt_limit) = (state.gdtr.limit, state.idtr.limit);
+        assert_eq!((gdt_limit, idt_limit), (0x77, 0xfff));
+        assert_eq!(
+            (state.fs_base, state.gs_base, state.debugctl),
+            (0x3000, 0x4000, 5)
+        );
+        for unsupported in [g::CS_SELECTOR, g::TR_BASE, g::TR_LIMIT, g::LDTR_SELECTOR] {
+            assert!(NativeReturnState::capture(|field| {
+                if field == unsupported {
+                    Ok(0xdead)
+                } else {
+                    read(field)
+                }
+            })
+            .is_err());
+        }
     }
 }
