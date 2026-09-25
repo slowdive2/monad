@@ -1,5 +1,7 @@
 # monad
 
+paused systems research project while i focus on kvm
+
 monad is an experimental Intel VT-x hypervisor for studying second-level
 address translation on a running x86-64 Windows system.
 
